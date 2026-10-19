@@ -3,7 +3,7 @@ import { createRef } from "react"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { at, installDomStubs, pointer } from "@/test/domStubs"
-import { EMPTY_BOARD, type Board } from "@/lib/whiteboard"
+import { EMPTY_BOARD, toWire, fromServer, type Board } from "@/lib/whiteboard"
 import { SmartBoard, type Tool } from "./SmartBoard"
 
 const BOARD: Board = {
@@ -148,6 +148,106 @@ describe("SmartBoard tools", () => {
       w: 6,
       color: "#ef4444",
     })
+  })
+
+  it("highlighter persists selected color (red, blue, green, and default yellow) in saved stroke", () => {
+    // Red highlighter
+    const redMount = mount("highlighter", { currentColor: "#ef4444" })
+    let o = overlay(redMount.container)!
+    run(() => pointer(o, "pointerdown", ...at(100, 100)))
+    run(() => pointer(o, "pointermove", ...at(150, 100)))
+    run(() => pointer(o, "pointerup", ...at(150, 100)))
+    expect(redMount.onChange).toHaveBeenCalledTimes(1)
+    expect(redMount.onChange.mock.calls[0][0].strokes[0]).toMatchObject({
+      t: "h",
+      color: "#ef4444",
+    })
+
+    // Green highlighter
+    const greenMount = mount("highlighter", { currentColor: "#22c55e" })
+    o = overlay(greenMount.container)!
+    run(() => pointer(o, "pointerdown", ...at(200, 100)))
+    run(() => pointer(o, "pointermove", ...at(250, 100)))
+    run(() => pointer(o, "pointerup", ...at(250, 100)))
+    expect(greenMount.onChange).toHaveBeenCalledTimes(1)
+    expect(greenMount.onChange.mock.calls[0][0].strokes[0]).toMatchObject({
+      t: "h",
+      color: "#22c55e",
+    })
+
+    // Blue highlighter
+    const blueMount = mount("highlighter", { currentColor: "#3b82f6" })
+    o = overlay(blueMount.container)!
+    run(() => pointer(o, "pointerdown", ...at(300, 100)))
+    run(() => pointer(o, "pointermove", ...at(350, 100)))
+    run(() => pointer(o, "pointerup", ...at(350, 100)))
+    expect(blueMount.onChange).toHaveBeenCalledTimes(1)
+    expect(blueMount.onChange.mock.calls[0][0].strokes[0]).toMatchObject({
+      t: "h",
+      color: "#3b82f6",
+    })
+
+    // Default highlighter fallback
+    const defaultMount = mount("highlighter", { currentColor: "" })
+    o = overlay(defaultMount.container)!
+    run(() => pointer(o, "pointerdown", ...at(400, 100)))
+    run(() => pointer(o, "pointermove", ...at(450, 100)))
+    run(() => pointer(o, "pointerup", ...at(450, 100)))
+    expect(defaultMount.onChange).toHaveBeenCalledTimes(1)
+    expect(defaultMount.onChange.mock.calls[0][0].strokes[0]).toMatchObject({
+      t: "h",
+      color: "#facc15",
+    })
+  })
+
+  it("highlighter colors survive serialization and reload (save/reload)", () => {
+    const strokes = [
+      { t: "h" as const, w: 6, pts: [[10, 10], [100, 10]] as [number, number][], color: "#ef4444" },
+      { t: "h" as const, w: 6, pts: [[10, 50], [100, 50]] as [number, number][], color: "#22c55e" },
+      { t: "h" as const, w: 6, pts: [[10, 90], [100, 90]] as [number, number][], color: "#3b82f6" },
+      { t: "h" as const, w: 6, pts: [[10, 130], [100, 130]] as [number, number][] }, // backward compatibility: no color field
+    ]
+    const b = { ...EMPTY_BOARD, strokes }
+    const wire = toWire(b)
+    expect(wire.strokes[0].color).toBe("#ef4444")
+    expect(wire.strokes[1].color).toBe("#22c55e")
+    expect(wire.strokes[2].color).toBe("#3b82f6")
+
+    const reloaded = fromServer(wire as any)
+    expect(reloaded.strokes[0].color).toBe("#ef4444")
+    expect(reloaded.strokes[1].color).toBe("#22c55e")
+    expect(reloaded.strokes[2].color).toBe("#3b82f6")
+    expect(reloaded.strokes[3].color).toBeUndefined()
+  })
+
+  it("text tool: clicking existing text opens it for editing at exact location", () => {
+    const existingText = {
+      id: "t1",
+      kind: "text" as const,
+      author: "student" as const,
+      seq: 0,
+      x: 300,
+      y: 400,
+      w: 200,
+      h: 80,
+      text: "Existing Text",
+      color: "#2563eb",
+    }
+    const { container, onChange } = mount("text", {
+      board: { ...EMPTY_BOARD, elements: [existingText], nextSeq: 1 },
+    })
+    run(() => pointer(overlay(container)!, "pointerdown", ...at(350, 420)))
+    const box = screen.getByLabelText("Text on the board") as HTMLTextAreaElement
+    expect(box).toBeTruthy()
+    expect(box.value).toBe("Existing Text")
+
+    fireEvent.change(box, { target: { value: "Updated Text Content" } })
+    fireEvent.keyDown(box, { key: "Enter" })
+    expect(onChange).toHaveBeenCalledTimes(1)
+    const updated = onChange.mock.calls[0][0].elements.find((e: any) => e.id === "t1")
+    expect(updated.text).toBe("Updated Text Content")
+    expect(updated.x).toBe(300)
+    expect(updated.y).toBe(400)
   })
 
   it("arrow tool: dragging from one element to another creates a LINKED arrow", () => {

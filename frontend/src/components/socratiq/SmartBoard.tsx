@@ -50,8 +50,9 @@ function paint(ctx: CanvasRenderingContext2D, s: Stroke, strokeColor?: string) {
   } else if (s.t === "h") {
     ctx.globalAlpha = 0.35
     ctx.lineWidth = s.w * 4
-    ctx.strokeStyle = "#facc15"
-    ctx.fillStyle = "#facc15"
+    const color = strokeColor || s.color || "#facc15"
+    ctx.strokeStyle = color
+    ctx.fillStyle = color
   } else {
     ctx.lineWidth = s.w
     const color = strokeColor || s.color || INK
@@ -145,6 +146,9 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
   const [dragPos, setDragPos] = useState<{ id: string; x: number; y: number } | null>(null)
   const [multiDragOffset, setMultiDragOffset] = useState<{ dx: number; dy: number } | null>(null)
   const [editing, setEditing] = useState<Editing | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const editMountTimeRef = useRef<number>(0)
+  const isCommittingRef = useRef<boolean>(false)
   const [interactionMode, setInteractionMode] = useState<"idle" | "resizing" | "rotating" | "selecting">("idle")
   const [selectionRect, setSelectionRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
 
@@ -315,16 +319,24 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
     if (tool === "pen" || tool === "highlighter" || tool === "eraser") {
       if (!canAddStroke(board)) return
       e.currentTarget.setPointerCapture(e.pointerId)
-      const strokeW = tool === "highlighter" ? 6 : (strokeWidth || 4)
+      const strokeW = tool === "highlighter" ? (strokeWidth ? Math.max(strokeWidth, 6) : 6) : (strokeWidth || 4)
+      const strokeCol = tool === "eraser" ? undefined : (currentColor || (tool === "highlighter" ? "#facc15" : INK))
       drawing.current = {
         t: tool === "pen" ? "p" : tool === "highlighter" ? "h" : "e",
         w: strokeW,
         pts: [p],
-        color: tool === "pen" ? currentColor : undefined,
+        color: strokeCol,
       }
       const c = canvas.current?.getContext("2d")
-      if (c) paint(c, drawing.current, tool === "pen" ? currentColor : undefined)
+      if (c) paint(c, drawing.current, strokeCol)
     } else if (tool === "text") {
+      e.preventDefault()
+      e.stopPropagation()
+      const hit = hitElement(board, p[0], p[1])
+      if (hit && hit.kind === "text") {
+        setEditing({ id: hit.id, x: hit.x, y: hit.y, value: hit.text ?? "", color: hit.color })
+        return
+      }
       const safeX = Math.max(20, Math.min(p[0], BOARD_W - 320))
       const safeY = Math.max(20, Math.min(p[1], BOARD_H - 120))
       setEditing({ id: null, x: safeX, y: safeY, value: "", color: currentColor })
@@ -355,7 +367,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
       s.pts.push(p)
       if (s.pts.length >= LIMITS.strokePoints) return up(e)
       const c = canvas.current?.getContext("2d")
-      if (c) paint(c, { ...s, pts: s.pts.slice(-2) }, s.color || (tool === "pen" ? currentColor : undefined))
+      if (c) paint(c, { ...s, pts: s.pts.slice(-2) }, s.color || (tool === "eraser" ? undefined : (currentColor || (tool === "highlighter" ? "#facc15" : INK))))
     } else if (draft) {
       setDraft({ ...draft, b: p })
     }
@@ -373,7 +385,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
       const completedStroke: Stroke = {
         ...s,
         pts: simplify(s.pts),
-        color: s.t === "p" ? (s.color || currentColor) : undefined,
+        color: s.t === "e" ? undefined : (s.color || currentColor || (s.t === "h" ? "#facc15" : INK)),
       }
       onChange({ ...board, strokes: [...board.strokes, completedStroke] })
       return
@@ -605,8 +617,13 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
   }
 
   function commitEdit() {
+    if (isCommittingRef.current) return
+    isCommittingRef.current = true
     const ed = editing
     setEditing(null)
+    setTimeout(() => {
+      isCommittingRef.current = false
+    }, 50)
     if (!ed || !onChange) return
     const text = ed.value.trim().slice(0, LIMITS.textChars)
     if (!text) {
@@ -633,6 +650,17 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
       onToolChange?.("select")
     }
   }
+
+  useEffect(() => {
+    if (editing) {
+      editMountTimeRef.current = Date.now()
+      textareaRef.current?.focus()
+      const t = setTimeout(() => {
+        textareaRef.current?.focus()
+      }, 50)
+      return () => clearTimeout(t)
+    }
+  }, [editing?.id, editing?.x, editing?.y])
 
   const isEmpty = board.elements.length === 0 && board.strokes.length === 0 && !editing
   const px = (el: BoardElement) => {
@@ -1136,6 +1164,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
           {/* Active text input textarea */}
           {editing && (
             <textarea
+              ref={textareaRef}
               autoFocus
               dir="auto"
               value={editing.value}
@@ -1143,13 +1172,21 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
               aria-label="Text on the board"
               placeholder="Type text here… (Shift+Enter for newline, Enter to save)"
               onChange={(e) => setEditing({ ...editing, value: e.target.value })}
-              onBlur={commitEdit}
+              onPointerDown={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+              onBlur={(e) => {
+                if (Date.now() - editMountTimeRef.current < 150) {
+                  e.target.focus()
+                  return
+                }
+                commitEdit()
+              }}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                e.stopPropagation()
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault()
                   commitEdit()
-                }
-                if (e.key === "Escape") {
+                } else if (e.key === "Escape") {
                   e.preventDefault()
                   const wasNew = !editing.id
                   setEditing(null)

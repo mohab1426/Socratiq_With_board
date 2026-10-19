@@ -1,0 +1,1637 @@
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react"
+import ReactMarkdown from "react-markdown"
+import { ChevronDown, Sparkles, MessageSquare, Mic, Send, Square, X, Loader2 } from "lucide-react"
+import { MathView } from "@/components/socratiq/MathView"
+import { SmartBoard, type Tool, type ViewState, type SmartBoardHandle } from "@/components/socratiq/SmartBoard"
+import { SmartBoardToolbar, type AIState } from "@/components/socratiq/SmartBoardToolbar"
+import { Button } from "@/components/ui/Button"
+import { ASK_ACTIONS, type BoardIntent } from "@/lib/boardAsk"
+import { saveWhiteboard } from "@/lib/queries"
+import {
+  BOARD_W, BOARD_H, LIMITS, addElement, commit, fromLegacy, fromServer, nextSeq, redo, removeElement, startHistory, toWire, undo, updateElement,
+  type Board, type History, type BoardElement,
+} from "@/lib/whiteboard"
+import {
+  generateImageContent,
+  generateSimulationCode,
+  generateVectorDrawing,
+  sendChatProxy,
+  getLiveWebSocketUrl
+} from "@/lib/geminiSmartBoardService"
+import {
+  MODEL_NAMES,
+  whiteboardTools,
+  SMARTBOARD_SYSTEM_INSTRUCTION
+} from "@/lib/smartboardConstants"
+import { getSmartPlacement } from "@/lib/smartPlacement"
+import { cn } from "@/lib/utils"
+
+export interface BoardApi {
+  flush: () => Promise<boolean>
+  applyServer: (b: Partial<Board>) => number
+  selectedId: () => string | null
+}
+
+interface Props {
+  assignmentId: string
+  initial: Board
+  readOnly?: boolean
+  busy: boolean
+  onAsk: (intent: BoardIntent, message: string) => void
+}
+
+const encodeAudio = (bytes: Uint8Array): string => {
+  let binary = ""
+  const len = bytes.byteLength
+  for (let i = 0; i < len; i += 8192) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, len)) as any)
+  }
+  return btoa(binary)
+}
+const decodeAudio = (base64: string) => Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+
+const decodeAudioData = async (data: Uint8Array, ctx: AudioContext) => {
+  try {
+    const sampleCount = Math.floor(data.byteLength / 2)
+    if (sampleCount === 0) return null
+    const dataView = new DataView(data.buffer, data.byteOffset, sampleCount * 2)
+    const buffer = ctx.createBuffer(1, sampleCount, 24000)
+    const channelData = buffer.getChannelData(0)
+    for (let i = 0; i < sampleCount; i++) {
+      channelData[i] = dataView.getInt16(i * 2, true) / 32768.0
+    }
+    return buffer
+  } catch (e) {
+    console.error("Audio decode error", e)
+    return null
+  }
+}
+
+const playAudio = async (
+  base64: string,
+  audioContext: AudioContext,
+  nextStartTime: React.MutableRefObject<number>,
+  activeSourcesRef?: React.MutableRefObject<AudioBufferSourceNode[]>,
+  onAllSourcesEnded?: () => void
+) => {
+  if (!audioContext) return
+  if (audioContext.state === "suspended") {
+    try {
+      await audioContext.resume()
+    } catch {}
+  }
+  try {
+    const arrayBuffer = decodeAudio(base64)
+    const audioBuffer = await decodeAudioData(arrayBuffer, audioContext)
+    if (!audioBuffer) return
+    const source = audioContext.createBufferSource()
+    source.buffer = audioBuffer
+    source.connect(audioContext.destination)
+    const startTime = Math.max(audioContext.currentTime, nextStartTime.current)
+    source.start(startTime)
+    nextStartTime.current = startTime + audioBuffer.duration
+
+    if (activeSourcesRef) {
+      activeSourcesRef.current.push(source)
+      source.onended = () => {
+        if (activeSourcesRef) {
+          activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source)
+          if (activeSourcesRef.current.length === 0) {
+            onAllSourcesEnded?.()
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Playback error", e)
+  }
+}
+
+function createBlob(data: Float32Array): { data: string; mimeType: string } {
+  const l = data.length
+  const int16 = new Int16Array(l)
+  for (let i = 0; i < l; i++) {
+    const s = Math.max(-1, Math.min(1, data[i]))
+    int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+  }
+  return {
+    data: encodeAudio(new Uint8Array(int16.buffer)),
+    mimeType: "audio/pcm;rate=16000",
+  }
+}
+
+export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspace({ assignmentId, initial, readOnly = false, busy, onAsk }, ref) {
+  const [seed] = useState(() => fromLegacy(initial))
+  const [hist, setHist] = useState<History>(() => startHistory(seed))
+  const [tool, setTool] = useState<Tool>("select")
+  const [grid, setGrid] = useState(false)
+  const [theme, setTheme] = useState<"light" | "dark">("light")
+  const [currentColor, setCurrentColor] = useState<string>("#000000")
+  const [strokeWidth, setStrokeWidth] = useState<number>(4)
+  const [filled, setFilled] = useState(false)
+  const [fontSize, setFontSize] = useState(24)
+  const [viewState, setViewState] = useState<ViewState>({ x: 0, y: 0, scale: 0.4 })
+  const clipboardRef = useRef<BoardElement[]>([])
+
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [fresh, setFresh] = useState<Map<string, number>>(new Map())
+  const [eq, setEq] = useState<{ x: number; y: number; editId?: string; value: string } | null>(null)
+  const [eqOk, setEqOk] = useState(true)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [askOpen, setAskOpen] = useState(false)
+  const [status, setStatus] = useState("")
+
+  // AI & Voice State
+  const [aiState, setAiState] = useState<AIState>({ isConnected: false, isListening: false, modelState: "idle" })
+  const [isAIProcessing, setIsAIProcessing] = useState(false)
+
+  // Floating SmartBoard AI Chat State
+  const [chatMessages, setChatMessages] = useState<Array<{ id: string; role: "user" | "model"; text: string; audio?: string; mimeType?: string }>>([])
+  const [chatInputText, setChatInputText] = useState("")
+  const [isChatProcessing, setIsChatProcessing] = useState(false)
+  const [showChat, setShowChat] = useState(false)
+  const [isRecordingChat, setIsRecordingChat] = useState(false)
+  const chatMediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const chatAudioChunksRef = useRef<Blob[]>([])
+  const chatEndRef = useRef<HTMLDivElement>(null)
+  const smartBoardRef = useRef<SmartBoardHandle | null>(null)
+
+  const board = hist.present
+  const latest = useRef<Board>(seed)
+  const dirty = useRef(seed.steps.length !== initial.steps.length || initial.steps.some((s) => s.trim()))
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sel = useRef<string | null>(null)
+  const selIds = useRef<string[]>([])
+  const root = useRef<HTMLDivElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Live WebSocket Audio & Capture Refs
+  const liveWsRef = useRef<WebSocket | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const inputContextRef = useRef<AudioContext | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const nextStartTime = useRef<number>(0)
+  const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([])
+  const captureIntervalRef = useRef<number | undefined>(undefined)
+
+  const flushRef = useRef<() => Promise<boolean>>(async () => true)
+  const flush = useCallback(async (): Promise<boolean> => {
+    if (timer.current) {
+      clearTimeout(timer.current)
+      timer.current = null
+    }
+    if (!dirty.current || readOnly) return true
+    const snapshot = latest.current
+    setStatus("Saving…")
+    try {
+      await saveWhiteboard(assignmentId, toWire(snapshot))
+      if (latest.current === snapshot) dirty.current = false
+      setStatus("Saved")
+      return true
+    } catch (e: any) {
+      if (e?.status === 413 || e?.code === "board_too_large" || (e?.message && e.message.includes("413"))) {
+        setStatus("Board exceeds storage limit (400KB). Please remove some strokes or images.")
+      } else {
+        setStatus("Couldn't save. Will retry.")
+        timer.current = setTimeout(() => void flushRef.current(), 4000)
+      }
+      return false
+    }
+  }, [assignmentId, readOnly])
+
+  useEffect(() => {
+    flushRef.current = flush
+  }, [flush])
+
+  const schedule = useCallback(() => {
+    dirty.current = true
+    setStatus("Unsaved changes")
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = setTimeout(() => void flush(), 1200)
+  }, [flush])
+
+  const change = useCallback(
+    (b: Board) => {
+      latest.current = b
+      setHist((h) => commit(h, b))
+      schedule()
+    },
+    [schedule]
+  )
+
+  const handleColorChange = useCallback((newColor: string) => {
+    setCurrentColor(newColor)
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size > 0) {
+      const updated = latest.current.elements.map((el) =>
+        targetIds.has(el.id) ? { ...el, color: newColor } : el
+      )
+      change({ ...latest.current, elements: updated })
+    }
+  }, [change])
+
+  const handleStrokeWidthChange = useCallback((newWidth: number) => {
+    setStrokeWidth(newWidth)
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size > 0) {
+      const updated = latest.current.elements.map((el) =>
+        targetIds.has(el.id) ? { ...el, strokeWidth: newWidth } : el
+      )
+      change({ ...latest.current, elements: updated })
+    }
+  }, [change])
+
+  const handleFillToggle = useCallback(() => {
+    const nextFilled = !filled
+    setFilled(nextFilled)
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size > 0) {
+      const updated = latest.current.elements.map((el) =>
+        targetIds.has(el.id) ? { ...el, filled: nextFilled } : el
+      )
+      change({ ...latest.current, elements: updated })
+    }
+  }, [filled, change])
+
+  const handleFontSizeChange = useCallback((newSize: number) => {
+    setFontSize(newSize)
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size > 0) {
+      const updated = latest.current.elements.map((el) =>
+        targetIds.has(el.id) ? { ...el, fontSize: newSize } : el
+      )
+      change({ ...latest.current, elements: updated })
+    }
+  }, [change])
+
+  const handleToolChange = useCallback((nextTool: Tool) => {
+    setTool(nextTool)
+  }, [])
+
+  const syncToolbarToElement = useCallback((targetEl: BoardElement) => {
+    if (targetEl.color) setCurrentColor(targetEl.color)
+    if (targetEl.strokeWidth) setStrokeWidth(targetEl.strokeWidth)
+    if (targetEl.filled !== undefined) setFilled(targetEl.filled)
+    if (targetEl.fontSize) setFontSize(targetEl.fontSize)
+  }, [])
+
+  const doUndo = useCallback(() => {
+    setHist((h) => {
+      const n = undo(h)
+      latest.current = n.present
+      if (n !== h) schedule()
+      return n
+    })
+  }, [schedule])
+
+  const doRedo = useCallback(() => {
+    setHist((h) => {
+      const n = redo(h)
+      latest.current = n.present
+      if (n !== h) schedule()
+      return n
+    })
+  }, [schedule])
+
+  const select = useCallback((id: string | null) => {
+    sel.current = id
+    setSelectedId(id)
+    const nextArr = id ? [id] : []
+    selIds.current = nextArr
+    setSelectedIds(nextArr)
+    if (id) {
+      const targetEl = latest.current.elements.find((e) => e.id === id)
+      if (targetEl) syncToolbarToElement(targetEl)
+    }
+  }, [syncToolbarToElement])
+
+  const selectMultiple = useCallback((ids: string[]) => {
+    selIds.current = ids
+    setSelectedIds(ids)
+    const single = ids.length === 1 ? ids[0] : null
+    sel.current = single
+    setSelectedId(single)
+    if (single) {
+      const targetEl = latest.current.elements.find((e) => e.id === single)
+      if (targetEl) syncToolbarToElement(targetEl)
+    }
+  }, [syncToolbarToElement])
+
+  const handleCopy = useCallback(() => {
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size === 0) return
+    const selectedEls = latest.current.elements.filter((el) => targetIds.has(el.id))
+    clipboardRef.current = selectedEls
+  }, [])
+
+  const handlePaste = useCallback(() => {
+    if (!clipboardRef.current || clipboardRef.current.length === 0) return
+    const current = latest.current
+    const newSelectedIds: string[] = []
+    const pasted: BoardElement[] = []
+    clipboardRef.current.forEach((el) => {
+      const clonedId = "u_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+      const clone: BoardElement = {
+        ...el,
+        id: clonedId,
+        seq: nextSeq(current),
+        x: Math.min(BOARD_W - 40, el.x + 30),
+        y: Math.min(BOARD_H - 40, el.y + 30),
+      }
+      if (el.kind === "line" && el.x2 !== undefined && el.y2 !== undefined) {
+        clone.x2 = Math.min(BOARD_W, el.x2 + 30)
+        clone.y2 = Math.min(BOARD_H, el.y2 + 30)
+      }
+      pasted.push(clone)
+      newSelectedIds.push(clonedId)
+    })
+    change({ ...current, elements: [...current.elements, ...pasted] })
+    selectMultiple(newSelectedIds)
+  }, [change, selectMultiple])
+
+  const handleScaleSelected = useCallback((factor: number) => {
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size === 0) return
+    const updated = latest.current.elements.map((el) => {
+      if (targetIds.has(el.id)) {
+        const newW = Math.max(20, Math.round(el.w * factor))
+        const newH = Math.max(20, Math.round(el.h * factor))
+        const next: BoardElement = { ...el, w: newW, h: newH }
+        if (el.kind === "line" && el.x2 !== undefined && el.y2 !== undefined) {
+          next.x2 = el.x + Math.round((el.x2 - el.x) * factor)
+          next.y2 = el.y + Math.round((el.y2 - el.y) * factor)
+        }
+        return next
+      }
+      return el
+    })
+    change({ ...latest.current, elements: updated })
+  }, [change])
+
+  const handleSetSizePreset = useCallback((preset: "small" | "medium" | "large") => {
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size === 0) return
+
+    const baseSizes: Record<"small" | "medium" | "large", number> = {
+      small: 180,
+      medium: 320,
+      large: 520,
+    }
+    const targetDim = baseSizes[preset]
+
+    const updated = latest.current.elements.map((el) => {
+      if (targetIds.has(el.id)) {
+        const ratio = el.w / Math.max(1, el.h)
+        let newW = targetDim
+        let newH = Math.round(targetDim / ratio)
+        if (el.kind === "circle" || el.shape === "circle") {
+          newW = targetDim
+          newH = targetDim
+        } else if (el.kind === "text") {
+          const fontSizes = { small: 20, medium: 32, large: 52 }
+          return { ...el, fontSize: fontSizes[preset], w: Math.max(120, targetDim) }
+        }
+        return { ...el, w: newW, h: newH }
+      }
+      return el
+    })
+    change({ ...latest.current, elements: updated })
+  }, [change])
+
+  const handleDuplicate = useCallback(() => {
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size === 0) return
+    const current = latest.current
+    const clones: BoardElement[] = []
+    const newSelectedIds: string[] = []
+
+    current.elements.forEach((el) => {
+      if (targetIds.has(el.id)) {
+        const newId = "dup_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+        const clone: BoardElement = {
+          ...el,
+          id: newId,
+          x: Math.min(BOARD_W - 40, el.x + 30),
+          y: Math.min(BOARD_H - 40, el.y + 30),
+        }
+        if (el.kind === "line" && el.x2 !== undefined && el.y2 !== undefined) {
+          clone.x2 = Math.min(BOARD_W, el.x2 + 30)
+          clone.y2 = Math.min(BOARD_H, el.y2 + 30)
+        }
+        clones.push(clone)
+        newSelectedIds.push(newId)
+      }
+    })
+
+    if (clones.length > 0) {
+      change({ ...current, elements: [...current.elements, ...clones] })
+      selectMultiple(newSelectedIds)
+    }
+  }, [change, selectMultiple])
+
+  const handleReorder = useCallback((direction: "front" | "back") => {
+    const targetIds = new Set(selIds.current.length > 0 ? selIds.current : sel.current ? [sel.current] : [])
+    if (targetIds.size === 0) return
+    const current = latest.current
+    const selectedEls = current.elements.filter((el) => targetIds.has(el.id))
+    const nonSelectedEls = current.elements.filter((el) => !targetIds.has(el.id))
+
+    const reordered = direction === "front"
+      ? [...nonSelectedEls, ...selectedEls]
+      : [...selectedEls, ...nonSelectedEls]
+
+    change({ ...current, elements: reordered })
+  }, [change])
+
+  const handleFitView = useCallback(() => {
+    const currentElements = latest.current.elements
+    if (currentElements.length === 0) {
+      setViewState({ x: 0, y: 0, scale: 0.4 })
+      return
+    }
+
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+
+    currentElements.forEach((el) => {
+      minX = Math.min(minX, el.x)
+      minY = Math.min(minY, el.y)
+      maxX = Math.max(maxX, el.x + el.w)
+      maxY = Math.max(maxY, el.y + el.h)
+    })
+
+    const pad = 120
+    const contentW = Math.max(400, maxX - minX + pad * 2)
+    const contentH = Math.max(400, maxY - minY + pad * 2)
+
+    const viewW = root.current?.clientWidth || 1000
+    const viewH = root.current?.clientHeight || 700
+
+    const scale = Math.max(0.15, Math.min(1.2, Math.min(viewW / contentW, viewH / contentH)))
+    const centerX = (minX + maxX) / 2
+    const centerY = (minY + maxY) / 2
+
+    setViewState({
+      x: centerX - viewW / (2 * scale),
+      y: centerY - viewH / (2 * scale),
+      scale,
+    })
+  }, [])
+
+  const [isFullscreen, setIsFullscreen] = useState(false)
+
+  const toggleFullscreen = useCallback(async () => {
+    try {
+      if (!document.fullscreenElement) {
+        if (root.current?.requestFullscreen) {
+          await root.current.requestFullscreen()
+        } else {
+          setIsFullscreen(true)
+        }
+      } else {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen()
+        }
+        setIsFullscreen(false)
+      }
+    } catch {
+      setIsFullscreen((prev) => !prev)
+    }
+  }, [])
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement)
+      setTimeout(() => {
+        handleFitView()
+      }, 100)
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isFullscreen) {
+        if (document.fullscreenElement && document.exitFullscreen) {
+          document.exitFullscreen().catch(() => {})
+        }
+        setIsFullscreen(false)
+        setTimeout(() => {
+          handleFitView()
+        }, 100)
+      }
+    }
+    document.addEventListener("fullscreenchange", handleFullscreenChange)
+    window.addEventListener("keydown", handleKeyDown)
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange)
+      window.removeEventListener("keydown", handleKeyDown)
+    }
+  }, [handleFitView, isFullscreen])
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      flush,
+      selectedId: () => sel.current,
+      applyServer: (raw) => {
+        const next = fromServer(raw)
+        const before = new Set(latest.current.elements.map((e) => e.id))
+        const added = next.elements.filter((e) => e.author === "coach" && !before.has(e.id)).map((e) => e.id)
+        if (timer.current) {
+          clearTimeout(timer.current)
+          timer.current = null
+        }
+        dirty.current = false
+        latest.current = next
+        setHist((h) => commit(h, next))
+        setFresh(new Map(added.map((id, i) => [id, i])))
+        setStatus("Saved")
+        return added.length
+      },
+    }),
+    [flush]
+  )
+
+  useEffect(() => () => {
+    if (timer.current) clearTimeout(timer.current)
+    if (dirty.current && !readOnly) void saveWhiteboard(assignmentId, toWire(latest.current)).catch(() => undefined)
+  }, [assignmentId, readOnly])
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    if (readOnly) return
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return
+      if (!root.current || root.current.closest(".hidden")) return
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault()
+        if (e.shiftKey) doRedo()
+        else doUndo()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
+        e.preventDefault()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d" && !busy) {
+        if (selIds.current.length > 0 || sel.current) {
+          e.preventDefault()
+          handleDuplicate()
+        }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && !busy) {
+        if (selIds.current.length > 0 || sel.current) {
+          e.preventDefault()
+          handleCopy()
+        }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && !busy) {
+        if (clipboardRef.current.length > 0) {
+          e.preventDefault()
+          handlePaste()
+        }
+      } else if ((e.key === "Delete" || e.key === "Backspace") && !busy) {
+        if (selIds.current.length > 0) {
+          e.preventDefault()
+          const toRemove = new Set(selIds.current)
+          change({ ...latest.current, elements: latest.current.elements.filter((el) => !toRemove.has(el.id)) })
+          select(null)
+        } else if (sel.current) {
+          e.preventDefault()
+          change(removeElement(latest.current, sel.current))
+          select(null)
+        }
+      } else if (e.key.toLowerCase() === "v" && !e.ctrlKey && !e.metaKey) {
+        setTool("select")
+      } else if (e.key.toLowerCase() === "h") {
+        setTool("pan")
+      } else if (e.key.toLowerCase() === "p") {
+        setTool("pen")
+      } else if (e.key.toLowerCase() === "t") {
+        setTool("text")
+      } else if (e.key.toLowerCase() === "e") {
+        setTool("eraser")
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [readOnly, busy, change, doUndo, doRedo, select, handleDuplicate, handleCopy, handlePaste])
+
+  // Image Upload handler
+  const handleImageUploadClick = () => fileInputRef.current?.click()
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const b64 = reader.result as string
+      const img = new Image()
+      img.onload = () => {
+        // Compress and resize image to fit comfortably within DB 400KB limit
+        const canvas = document.createElement("canvas")
+        const maxDim = 600
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
+        canvas.width = Math.round(img.width * scale)
+        canvas.height = Math.round(img.height * scale)
+        const ctx = canvas.getContext("2d")
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+        }
+        const compressedB64 = canvas.toDataURL("image/jpeg", 0.75)
+
+        const maxWidth = 450
+        const ratio = img.width / img.height
+        const w = Math.min(img.width, maxWidth)
+        const h = w / ratio
+        const pos = getSmartPlacement(latest.current, viewState, w, h, sel.current)
+        const newEl: BoardElement = {
+          id: "u_img_" + Date.now().toString(36),
+          kind: "image",
+          author: "student",
+          seq: 0,
+          x: pos.x,
+          y: pos.y,
+          w,
+          h,
+          src: compressedB64,
+          color: "#000000",
+          rotation: 0,
+        }
+        change({ ...latest.current, elements: [...latest.current.elements, newEl] })
+      }
+      img.src = b64
+    }
+    reader.readAsDataURL(file)
+    if (fileInputRef.current) fileInputRef.current.value = ""
+  }
+
+  // Whiteboard Function-calling tools execution (for Gemini Live and Chat)
+  const executeTools = async (functionCalls: any[]) => {
+    const responses = []
+    let addedElements: BoardElement[] = []
+    let shouldClear = false
+    let toDeleteIds: Set<string> = new Set()
+    let toMove: Array<{ id: string; x: number; y: number }> = []
+
+    const normalizeCoords = (x?: number, y?: number, w = 300, h = 100, currentBoard?: Board) => {
+      const boardToUse = currentBoard || latest.current
+      if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y) || (x === 0 && y === 0)) {
+        return getSmartPlacement(boardToUse, viewState, w, h, sel.current)
+      }
+      const clampedX = Math.round(Math.max(20, Math.min(BOARD_W - w - 20, x)))
+      const clampedY = Math.round(Math.max(20, Math.min(BOARD_H - h - 20, y)))
+      return { x: clampedX, y: clampedY }
+    }
+
+    for (const fc of functionCalls) {
+      const rawName = fc.name || fc.function_name || ""
+      const name = rawName === "add_text" ? "write_text"
+        : rawName === "add_line" ? "draw_line"
+        : rawName === "add_arrow" ? "draw_arrow"
+        : rawName === "move" ? "move_element_at"
+        : rawName === "delete" ? "delete_element_at"
+        : rawName
+      const args = fc.args || fc.parameters || {}
+      let result = { result: "ok" }
+      const id = "ai_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+
+      try {
+        if (name === "pan_view") {
+          setViewState((v) => ({ ...v, x: (args.x || 0) - 500, y: (args.y || 0) - 300 }))
+          result = { result: "View moved." }
+        } else if (name === "delete_element_at") {
+          const target = latest.current.elements.find((el) => Math.hypot(el.x + el.w / 2 - args.x, el.y + el.h / 2 - args.y) < 120)
+          if (target) {
+            toDeleteIds.add(target.id)
+            result = { result: "Element deleted." }
+          }
+        } else if (name === "move_element_at") {
+          const target = latest.current.elements.find((el) => Math.hypot(el.x + el.w / 2 - args.x, el.y + el.h / 2 - args.y) < 120)
+          if (target) {
+            toMove.push({ id: target.id, x: args.new_x, y: args.new_y })
+            result = { result: "Element moved." }
+          }
+        } else if (name === "draw_rectangle") {
+          const w = args.width || 120
+          const h = args.height || 80
+          const coords = normalizeCoords(args.x, args.y, w, h)
+          addedElements.push({
+            id,
+            kind: "shape",
+            shape: "rect",
+            author: "coach",
+            seq: 0,
+            x: coords.x,
+            y: coords.y,
+            w,
+            h,
+            color: args.color || "#3b82f6",
+            filled: args.filled,
+          })
+        } else if (name === "draw_circle") {
+          const r = args.radius || 40
+          const size = r * 2
+          const coords = normalizeCoords(args.x !== undefined ? args.x - r : undefined, args.y !== undefined ? args.y - r : undefined, size, size)
+          addedElements.push({
+            id,
+            kind: "circle",
+            shape: "circle",
+            author: "coach",
+            seq: 0,
+            x: coords.x,
+            y: coords.y,
+            w: size,
+            h: size,
+            color: args.color || "#ef4444",
+            filled: args.filled,
+          })
+        } else if (name === "draw_triangle") {
+          const w = args.width || 100
+          const h = args.height || 100
+          const coords = normalizeCoords(args.x, args.y, w, h)
+          addedElements.push({
+            id,
+            kind: "triangle",
+            shape: "triangle",
+            author: "coach",
+            seq: 0,
+            x: coords.x,
+            y: coords.y,
+            w,
+            h,
+            color: args.color || "#16a34a",
+            filled: args.filled,
+          })
+        } else if (name === "draw_line") {
+          addedElements.push({
+            id,
+            kind: "line",
+            author: "coach",
+            seq: 0,
+            x: args.x1 ?? 100,
+            y: args.y1 ?? 100,
+            w: Math.abs((args.x2 ?? 200) - (args.x1 ?? 100)),
+            h: Math.abs((args.y2 ?? 200) - (args.y1 ?? 100)),
+            x2: args.x2 ?? 200,
+            y2: args.y2 ?? 200,
+            color: args.color || "#000000",
+            strokeWidth: args.strokeWidth || 3,
+          })
+        } else if (name === "draw_path") {
+          addedElements.push({
+            id,
+            kind: "path",
+            author: "coach",
+            seq: 0,
+            x: args.x || 0,
+            y: args.y || 0,
+            w: args.width || 300,
+            h: args.height || 200,
+            pathData: args.pathData,
+            color: args.color || "#000000",
+            strokeWidth: args.strokeWidth || 3,
+          })
+        } else if (name === "draw_arrow") {
+          addedElements.push({
+            id,
+            kind: "arrow",
+            author: "coach",
+            seq: 0,
+            x: Math.min(args.x1 ?? 100, args.x2 ?? 200),
+            y: Math.min(args.y1 ?? 100, args.y2 ?? 200),
+            w: Math.abs((args.x2 ?? 200) - (args.x1 ?? 100)),
+            h: Math.abs((args.y2 ?? 200) - (args.y1 ?? 100)),
+            x2: args.x2 ?? 200,
+            y2: args.y2 ?? 200,
+            color: args.color || "#2563eb",
+            strokeWidth: args.strokeWidth || 4,
+          })
+        } else if (name === "write_text") {
+          const currentBoardState: Board = {
+            ...latest.current,
+            elements: [...latest.current.elements, ...addedElements],
+          }
+          const targetPos = normalizeCoords(args.x, args.y, 400, 80, currentBoardState)
+          addedElements.push({
+            id,
+            kind: "text",
+            author: "coach",
+            seq: 0,
+            x: targetPos.x,
+            y: targetPos.y,
+            w: 400,
+            h: 80,
+            text: args.text,
+            color: args.color || "#000000",
+            fontSize: 28,
+          })
+        } else if (name === "add_equation") {
+          const currentBoardState: Board = {
+            ...latest.current,
+            elements: [...latest.current.elements, ...addedElements],
+          }
+          const targetPos = normalizeCoords(args.x, args.y, 350, 90, currentBoardState)
+          addedElements.push({
+            id,
+            kind: "equation",
+            author: "coach",
+            seq: 0,
+            x: targetPos.x,
+            y: targetPos.y,
+            w: 350,
+            h: 90,
+            latex: args.latex,
+            color: args.color || "#000000",
+          })
+        } else if (name === "add_plot") {
+          const w = 480
+          const h = 340
+          const currentBoardState: Board = {
+            ...latest.current,
+            elements: [...latest.current.elements, ...addedElements],
+          }
+          const targetPos = normalizeCoords(args.x, args.y, w, h, currentBoardState)
+          const placeholder: BoardElement = {
+            id,
+            kind: "shape",
+            shape: "rect",
+            author: "coach",
+            seq: 0,
+            x: targetPos.x,
+            y: targetPos.y,
+            w,
+            h,
+            color: "#e2e8f0",
+            filled: true,
+            isLoading: true,
+          }
+          addedElements.push(placeholder)
+          const plotPrompt = `Create an interactive function plot / graph simulation for: "${args.title || 'Function Plot'}" with math formula "${args.expression}". Include interactive axes, coordinate grid, and clear visualization.`
+          generateSimulationCode(plotPrompt).then((code) => {
+            if (code) {
+              const current = latest.current
+              const updated = current.elements.map((e) =>
+                e.id === id ? { ...e, kind: "simulation" as const, code, title: args.title || "Math Plot", isLoading: false } : e
+              )
+              change({ ...current, elements: updated })
+            }
+          })
+        } else if (name === "clear_board") {
+          shouldClear = true
+        } else if (name === "generate_image") {
+          const w = 360
+          const h = 270
+          const currentBoardState: Board = {
+            ...latest.current,
+            elements: [...latest.current.elements, ...addedElements],
+          }
+          const targetPos = normalizeCoords(args.x, args.y, w, h, currentBoardState)
+          const placeholder: BoardElement = {
+            id,
+            kind: "shape",
+            shape: "rect",
+            author: "coach",
+            seq: 0,
+            x: targetPos.x,
+            y: targetPos.y,
+            w,
+            h,
+            color: "#e2e8f0",
+            filled: true,
+            isLoading: true,
+          }
+          addedElements.push(placeholder)
+          generateImageContent(args.prompt, args.size || "1K").then((src) => {
+            if (src) {
+              const current = latest.current
+              const updated = current.elements.map((e) => (e.id === id ? { ...e, kind: "image" as const, src, isLoading: false } : e))
+              change({ ...current, elements: updated })
+            }
+          })
+        } else if (name === "generate_simulation") {
+          const w = 480
+          const h = 360
+          const currentBoardState: Board = {
+            ...latest.current,
+            elements: [...latest.current.elements, ...addedElements],
+          }
+          const targetPos = normalizeCoords(args.x, args.y, w, h, currentBoardState)
+          const placeholder: BoardElement = {
+            id,
+            kind: "shape",
+            shape: "rect",
+            author: "coach",
+            seq: 0,
+            x: targetPos.x,
+            y: targetPos.y,
+            w,
+            h,
+            color: "#e2e8f0",
+            filled: true,
+            isLoading: true,
+          }
+          addedElements.push(placeholder)
+          generateSimulationCode(args.prompt).then((code) => {
+            if (code) {
+              const current = latest.current
+              const updated = current.elements.map((e) =>
+                e.id === id ? { ...e, kind: "simulation" as const, code, title: args.title, isLoading: false } : e
+              )
+              change({ ...current, elements: updated })
+            }
+          })
+        } else if (name === "generate_vector_drawing") {
+          setIsAIProcessing(true)
+          const originPos = normalizeCoords(args.x, args.y, 400, 300)
+          generateVectorDrawing(args.prompt).then((shapes) => {
+            setIsAIProcessing(false)
+            if (shapes && Array.isArray(shapes)) {
+              const newShapes: BoardElement[] = shapes.map((s: any) => ({
+                id: "v_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+                kind: s.type === "circle" ? "circle" : s.type === "triangle" ? "triangle" : s.type === "line" ? "line" : "shape",
+                shape: s.type === "circle" ? "circle" : s.type === "triangle" ? "triangle" : "rect",
+                author: "coach",
+                seq: 0,
+                x: originPos.x + (s.x || 0),
+                y: originPos.y + (s.y || 0),
+                w: s.width || (s.radius ? s.radius * 2 : 80),
+                h: s.height || (s.radius ? s.radius * 2 : 80),
+                color: s.color || "#000",
+                filled: !!s.filled,
+              }))
+              change({ ...latest.current, elements: [...latest.current.elements, ...newShapes] })
+            }
+          })
+        }
+      } catch (e) {
+        console.error(e)
+        result = { result: "Error executing tool" }
+      }
+      responses.push({ id: fc.id, name: fc.name, response: result })
+    }
+
+    if (shouldClear || addedElements.length > 0 || toDeleteIds.size > 0 || toMove.length > 0) {
+      let next = shouldClear ? [] : [...latest.current.elements]
+      if (toDeleteIds.size > 0) next = next.filter((e) => !toDeleteIds.has(e.id))
+      if (toMove.length > 0) {
+        next = next.map((e) => {
+          const op = toMove.find((m) => m.id === e.id)
+          return op ? { ...e, x: op.x, y: op.y } : e
+        })
+      }
+      next = [...next, ...addedElements]
+      change({ ...latest.current, elements: next })
+    }
+    return responses
+  }
+
+  // Gemini Multimodal Live Connection
+  const disconnectLive = useCallback(() => {
+    if (liveWsRef.current) {
+      const ws = liveWsRef.current
+      liveWsRef.current = null
+      ws.onclose = null
+      ws.onerror = null
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }))
+        } catch {}
+      }
+      try {
+        ws.close()
+      } catch {}
+    }
+    for (const s of activeAudioSourcesRef.current) {
+      try { s.stop() } catch {}
+    }
+    activeAudioSourcesRef.current = []
+    nextStartTime.current = 0
+    if (audioContextRef.current) {
+      try { audioContextRef.current.close() } catch {}
+      audioContextRef.current = null
+    }
+    if (inputContextRef.current) {
+      try { inputContextRef.current.close() } catch {}
+      inputContextRef.current = null
+    }
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current = null
+    if (captureIntervalRef.current) {
+      clearInterval(captureIntervalRef.current)
+      captureIntervalRef.current = undefined
+    }
+    setAiState({ isConnected: false, isListening: false, modelState: "idle" })
+  }, [])
+
+  const connectToLiveAPI = async () => {
+    if (liveWsRef.current) return
+    setAiState((s) => ({ ...s, modelState: "connecting" }))
+
+    try {
+      const wsUrl = getLiveWebSocketUrl()
+      const ws = new WebSocket(wsUrl)
+      liveWsRef.current = ws
+
+      ws.onopen = () => {
+        const setup = {
+          setup: {
+            model: `models/${MODEL_NAMES.LIVE}`,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: "Puck",
+                  },
+                },
+              },
+            },
+            systemInstruction: { parts: [{ text: SMARTBOARD_SYSTEM_INSTRUCTION }] },
+            tools: [{ functionDeclarations: whiteboardTools }],
+          },
+        }
+        ws.send(JSON.stringify(setup))
+      }
+
+      ws.onmessage = async (event) => {
+        let rawText = event.data
+        if (event.data instanceof Blob) {
+          rawText = await event.data.text()
+        } else if (event.data instanceof ArrayBuffer) {
+          rawText = new TextDecoder().decode(event.data)
+        }
+        let data: any
+        try {
+          data = typeof rawText === "string" ? JSON.parse(rawText) : rawText
+        } catch (e) {
+          console.error("Live message parse error", e)
+          return
+        }
+        if (!data) return
+        if (data.setupComplete || data.setup_complete) {
+          setAiState({ isConnected: true, isListening: true, modelState: "idle" })
+          // Start Audio Streaming
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+            streamRef.current = stream
+            inputContextRef.current = new AudioContext({ sampleRate: 16000 })
+            const source = inputContextRef.current.createMediaStreamSource(stream)
+            const processor = inputContextRef.current.createScriptProcessor(4096, 1, 1)
+            source.connect(processor)
+            processor.connect(inputContextRef.current.destination)
+
+            processor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0)
+              // Calculate volume for audio visualizer
+              let sum = 0
+              for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i]
+              const volume = Math.sqrt(sum / inputData.length)
+              window.dispatchEvent(new CustomEvent("audio-volume-update", { detail: volume }))
+
+              const pcmData = createBlob(inputData)
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  realtimeInput: {
+                    audio: {
+                      data: pcmData.data,
+                      mimeType: pcmData.mimeType,
+                    },
+                  },
+                }))
+              }
+            }
+
+            // Video/Board canvas capture every 2 seconds matching reference
+            captureIntervalRef.current = window.setInterval(async () => {
+              const b64 = await smartBoardRef.current?.getScreenCapture()
+              if (b64 && ws.readyState === WebSocket.OPEN) {
+                const cleanB64 = b64.includes(",") ? b64.split(",")[1] : b64
+                ws.send(JSON.stringify({
+                  realtimeInput: {
+                    video: {
+                      data: cleanB64,
+                      mimeType: "image/jpeg",
+                    },
+                  },
+                }))
+              }
+            }, 2000)
+          } catch (e) {
+            console.error("Mic access error", e)
+          }
+        }
+
+        // Handle tool calls at the top-level (standard Gemini Live format)
+        const toolCallObj = data.toolCall || data.tool_call
+        if (toolCallObj) {
+          const calls = toolCallObj.functionCalls || toolCallObj.function_calls || []
+          if (calls.length > 0) {
+            const toolResponses = await executeTools(calls)
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                toolResponse: {
+                  functionResponses: toolResponses.map((tr) => ({
+                    id: tr.id,
+                    response: tr.response,
+                  })),
+                },
+              }))
+            }
+          }
+        }
+
+        if (data.serverContent || data.server_content) {
+          const content = data.serverContent || data.server_content
+          if (content.interrupted) {
+            // Student spoke over AI - stop current playback immediately and reset schedule
+            for (const s of activeAudioSourcesRef.current) {
+              try { s.stop() } catch {}
+            }
+            activeAudioSourcesRef.current = []
+            if (audioContextRef.current) nextStartTime.current = audioContextRef.current.currentTime
+            setAiState((s) => ({ ...s, modelState: "listening" }))
+          }
+
+          const turn = content.modelTurn || content.model_turn
+          if (turn) {
+            for (const part of turn.parts) {
+              if (part.inlineData || part.inline_data) {
+                const inline = part.inlineData || part.inline_data
+                if (!audioContextRef.current) audioContextRef.current = new AudioContext({ sampleRate: 24000 })
+                playAudio(inline.data, audioContextRef.current, nextStartTime, activeAudioSourcesRef, () => {
+                  setAiState((s) => ({ ...s, modelState: "idle" }))
+                })
+                setAiState((s) => ({ ...s, modelState: "speaking" }))
+              }
+              const call = part.call || part.function_call || part.functionCall
+              if (call) {
+                const toolResponses = await executeTools(call.functionCalls || call.function_calls || [call])
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    toolResponse: {
+                      functionResponses: toolResponses.map((tr) => ({
+                        id: tr.id,
+                        response: tr.response,
+                      })),
+                    },
+                  }))
+                }
+              }
+            }
+          }
+
+          if (content.turnComplete || content.turn_complete) {
+            if (activeAudioSourcesRef.current.length === 0) {
+              setAiState((s) => ({ ...s, modelState: "idle" }))
+            }
+          }
+        }
+      }
+
+      ws.onclose = () => disconnectLive()
+      ws.onerror = () => disconnectLive()
+    } catch (e) {
+      console.error("Live connection failed", e)
+      disconnectLive()
+    }
+  }
+
+  const toggleMic = () => {
+    if (aiState.isConnected) disconnectLive()
+    else void connectToLiveAPI()
+  }
+
+  // Floating SmartBoard AI Chat functions
+  useEffect(() => {
+    if (showChat) chatEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [chatMessages, showChat])
+
+  const handleStartRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const recorder = new MediaRecorder(stream)
+      chatMediaRecorderRef.current = recorder
+      chatAudioChunksRef.current = []
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chatAudioChunksRef.current.push(event.data)
+      }
+      recorder.start()
+      setIsRecordingChat(true)
+    } catch (e) {
+      console.error("Mic access denied or unavailable", e)
+      setChatMessages((prev) => [
+        ...prev,
+        { id: Date.now().toString(), role: "model", text: "Microphone access was denied or is unavailable. Please check your browser microphone permissions." },
+      ])
+      setShowChat(true)
+      setIsRecordingChat(false)
+    }
+  }
+
+  const handleStopRecording = async () => {
+    if (!chatMediaRecorderRef.current) return
+    const recorder = chatMediaRecorderRef.current
+    return new Promise<void>((resolve) => {
+      recorder.onstop = async () => {
+        setIsRecordingChat(false)
+        recorder.stream.getTracks().forEach((t) => t.stop())
+        chatMediaRecorderRef.current = null
+
+        if (chatAudioChunksRef.current.length === 0) {
+          resolve()
+          return
+        }
+
+        const audioBlob = new Blob(chatAudioChunksRef.current, { type: "audio/wav" })
+        if (audioBlob.size === 0) {
+          resolve()
+          return
+        }
+
+        const reader = new FileReader()
+        reader.readAsDataURL(audioBlob)
+        reader.onloadend = async () => {
+          const resultStr = reader.result as string
+          const base64Audio = resultStr ? resultStr.split(",")[1] : ""
+          if (base64Audio) {
+            await sendChatMessage(undefined, base64Audio)
+          }
+          resolve()
+        }
+      }
+      recorder.stop()
+    })
+  }
+
+  const handleMicClick = () => {
+    if (isRecordingChat) void handleStopRecording()
+    else void handleStartRecording()
+  }
+
+  const sendChatMessage = async (text?: string, audioBase64?: string) => {
+    if (!text && !audioBase64) return
+    const displayText = text || (audioBase64 ? "🎙️ Voice Note (transcribing...)" : "")
+    const newMsg = {
+      id: Date.now().toString(),
+      role: "user" as const,
+      text: displayText,
+      ...(audioBase64 ? { audio: audioBase64, mimeType: "audio/wav" } : {})
+    }
+    setChatMessages((prev) => [...prev, newMsg])
+    setChatInputText("")
+    setIsChatProcessing(true)
+    setShowChat(true)
+
+    try {
+      const b64Screen = await smartBoardRef.current?.getScreenCapture()
+      const payloadMessages = [...chatMessages, newMsg].map((m) => ({
+        role: m.role,
+        text: m.text,
+        ...(m.audio ? { audio: m.audio, mime_type: m.mimeType || "audio/wav" } : {})
+      }))
+      let systemInstruction = SMARTBOARD_SYSTEM_INSTRUCTION
+      if (sel.current) {
+        const selectedEl = latest.current.elements.find((e) => e.id === sel.current)
+        if (selectedEl) {
+          systemInstruction += `\n\n[CURRENT USER SELECTION]: The student currently has selected element id="${selectedEl.id}", kind="${selectedEl.kind}", author="${selectedEl.author}". `
+          if (selectedEl.text) systemInstruction += `Text content: "${selectedEl.text}". `
+          if (selectedEl.latex) systemInstruction += `LaTeX equation: "${selectedEl.latex}". `
+          systemInstruction += `Bounding box: at (${selectedEl.x}, ${selectedEl.y}), width ${selectedEl.w}, height ${selectedEl.h}. If the student asks to explain, correct, or build upon this, focus directly on this selected element and place any new explanations or steps beside or below it.`
+        }
+      }
+
+      const result = await sendChatProxy(
+        payloadMessages,
+        b64Screen || null,
+        whiteboardTools,
+        systemInstruction
+      )
+
+      if (result.error) throw new Error(result.error)
+
+      if (result.text) {
+        setChatMessages((prev) => [...prev, { id: Date.now().toString(), role: "model", text: result.text }])
+      }
+
+      if (result.functionCalls && result.functionCalls.length > 0) {
+        await executeTools(result.functionCalls.map((fc: any) => fc.functionCall || fc))
+      }
+    } catch (e: any) {
+      console.error("Chat Error:", e)
+      const errorMsg = e?.message || "Sorry, I'm having trouble connecting right now."
+      setChatMessages((prev) => [
+        ...prev,
+        { id: Date.now().toString(), role: "model", text: `⚠️ ${errorMsg}` },
+      ])
+    } finally {
+      setIsChatProcessing(false)
+    }
+  }
+
+  function commitEquation() {
+    if (!eq) return
+    const latex = eq.value.trim()
+    if (!latex || latex.length > LIMITS.latexChars || !eqOk) return
+    if (eq.editId) change(updateElement(board, eq.editId, { latex }))
+    else {
+      const pos = (eq.x !== undefined && eq.y !== undefined && (eq.x !== 0 || eq.y !== 0))
+        ? { x: Math.min(eq.x, 1100), y: Math.min(eq.y, 1000) }
+        : getSmartPlacement(latest.current, viewState, 280, 80, sel.current)
+      const r = addElement(board, { kind: "equation", x: pos.x, y: pos.y, latex })
+      change(r.board)
+      if (r.id) select(r.id)
+    }
+    setEq(null)
+    handleToolChange("select")
+  }
+
+  const locked = busy || readOnly
+  const selectedExists = !!selectedId && board.elements.some((e) => e.id === selectedId)
+
+  return (
+    <div
+      ref={root}
+      className={cn(
+        "relative flex h-full min-h-0 flex-col overflow-hidden bg-[var(--color-surface-muted)]",
+        isFullscreen && "fixed inset-0 z-50 w-screen h-screen"
+      )}
+    >
+      {/* Top action header for SocratiQ Socratic coach interaction */}
+      <div className="flex items-center justify-between border-b border-[var(--color-border)] bg-white px-3 py-1.5 z-20">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold uppercase tracking-wider text-[var(--color-teal-dark)]">SmartBoard</span>
+          <span role="status" aria-live="polite" className="text-xs text-[var(--color-ink-muted)]">
+            {busy ? "SocratiQ is writing on the board…" : status}
+          </span>
+        </div>
+
+        <div className="relative">
+          <Button
+            type="button"
+            size="sm"
+            disabled={locked}
+            aria-haspopup="menu"
+            aria-expanded={askOpen}
+            onClick={(e) => {
+              e.stopPropagation()
+              setAskOpen((v) => !v)
+            }}
+            className="gap-1.5"
+          >
+            <Sparkles className="h-4 w-4" aria-hidden="true" />
+            <span>Ask SocratiQ</span>
+            <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+          </Button>
+          {askOpen && (
+            <div
+              role="menu"
+              className="absolute right-0 z-30 mt-1 w-56 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-white p-1 shadow-lg"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              {ASK_ACTIONS.map((a) => (
+                <button
+                  key={a.intent}
+                  role="menuitem"
+                  type="button"
+                  className="block w-full rounded-[var(--radius-sm)] px-3 py-2 text-left text-sm text-[var(--color-ink)] hover:bg-[var(--color-surface-muted)]"
+                  onClick={() => {
+                    setAskOpen(false)
+                    onAsk(a.intent, a.message(selectedExists))
+                  }}
+                >
+                  {a.label}
+                </button>
+              ))}
+              <p className="px-3 pb-1.5 pt-1 text-xs text-[var(--color-ink-muted)]">
+                {selectedExists ? "Acts on the selected item." : "Acts on the whole board."}
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Main Board Canvas Container with Toolbars */}
+      <div className="relative flex-1 min-h-0 w-full overflow-hidden">
+        {!readOnly && (
+          <SmartBoardToolbar
+            currentTool={tool}
+            setTool={handleToolChange}
+            currentColor={currentColor}
+            setColor={handleColorChange}
+            strokeWidth={strokeWidth}
+            setStrokeWidth={handleStrokeWidthChange}
+            filled={filled}
+            setFilled={setFilled}
+            fontSize={fontSize}
+            setFontSize={setFontSize}
+            theme={theme}
+            setTheme={setTheme}
+            aiState={aiState}
+            isAIProcessing={isAIProcessing}
+            onToggleMic={toggleMic}
+            onUndo={doUndo}
+            onRedo={doRedo}
+            confirmClear={confirmClear}
+            onClearClick={() => setConfirmClear(true)}
+            onClearConfirm={() => {
+              change({ ...board, strokes: [], elements: [], steps: [] })
+              select(null)
+              setConfirmClear(false)
+            }}
+            onClearCancel={() => setConfirmClear(false)}
+            canClear={board.elements.length > 0 || board.strokes.length > 0}
+            locked={locked}
+            onZoomIn={() => setViewState((v) => ({ ...v, scale: Math.min(v.scale * 1.2, 5) }))}
+            onZoomOut={() => setViewState((v) => ({ ...v, scale: Math.max(v.scale / 1.2, 0.1) }))}
+            onFitView={handleFitView}
+            zoomScale={viewState.scale}
+            onScaleSelected={handleScaleSelected}
+            onSetSizePreset={handleSetSizePreset}
+            onImageUpload={handleImageUploadClick}
+            onEquationClick={() => handleToolChange("equation")}
+            onDelete={() => {
+              if (selectedIds.length > 0) {
+                const toRemove = new Set(selectedIds)
+                change({ ...board, elements: board.elements.filter((el) => !toRemove.has(el.id)) })
+                select(null)
+              } else if (selectedId) {
+                change(removeElement(board, selectedId))
+                select(null)
+              }
+            }}
+            onDuplicate={handleDuplicate}
+            onReorder={handleReorder}
+            hasSelection={selectedIds.length > 0 || !!selectedId}
+            canUndo={hist.past.length > 0}
+            canRedo={hist.future.length > 0}
+            isFullscreen={isFullscreen}
+            onToggleFullscreen={toggleFullscreen}
+          />
+        )}
+
+        <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleFileChange} />
+
+        <SmartBoard
+          ref={smartBoardRef}
+          board={board}
+          onChange={change}
+          readOnly={readOnly}
+          busy={busy}
+          tool={tool}
+          grid={grid}
+          theme={theme}
+          currentColor={currentColor}
+          strokeWidth={strokeWidth}
+          filled={filled}
+          fontSize={fontSize}
+          selectedId={selectedId}
+          selectedIds={selectedIds}
+          onSelect={select}
+          onSelectionChange={selectMultiple}
+          fresh={fresh}
+          viewState={viewState}
+          onViewChange={setViewState}
+          onToolChange={handleToolChange}
+          onEquationRequest={(at, editId) => {
+            const el = editId ? board.elements.find((e) => e.id === editId) : undefined
+            setEq({ ...at, editId, value: el?.latex ?? "" })
+          }}
+        />
+
+        {/* Equation Editing Dialog */}
+        {eq && (
+          <div role="dialog" aria-label="Add an equation" className="absolute inset-x-3 top-4 z-40 mx-auto max-w-lg rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-white p-4 shadow-xl">
+            <label htmlFor="eq-input" className="text-sm font-semibold text-[var(--color-ink)]">
+              {eq.editId ? "Edit equation" : "Add an equation"}
+            </label>
+            <input
+              id="eq-input"
+              autoFocus
+              value={eq.value}
+              maxLength={LIMITS.latexChars}
+              placeholder="2x + 4 = 10"
+              onChange={(e) => setEq({ ...eq, value: e.target.value })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault()
+                  commitEquation()
+                }
+                if (e.key === "Escape") setEq(null)
+              }}
+              className="mt-2 h-10 w-full rounded-[var(--radius-sm)] border border-[var(--color-border-strong)] px-3 font-mono text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-teal-dark)]"
+            />
+            <p className="mt-1 text-xs text-[var(--color-ink-muted)]">LaTeX works: x^2, \frac{"{a}{b}"}, \sqrt{"{x}"}</p>
+            <div className="mt-3 flex min-h-[64px] items-center justify-center overflow-x-auto rounded-[var(--radius-sm)] bg-[var(--color-surface-muted)] px-3 py-2" aria-label="Preview">
+              {eq.value.trim() ? <MathView latex={eq.value} onStatus={setEqOk} /> : <span className="text-sm text-[var(--color-ink-muted)]">Preview</span>}
+            </div>
+            {eq.value.trim() && !eqOk && <p role="alert" className="mt-2 text-xs text-[var(--color-danger-ink)]">This can't be displayed as an equation yet. Check the brackets and commands.</p>}
+            <div className="mt-3 flex justify-end gap-2">
+              <Button type="button" size="sm" variant="secondary" onClick={() => setEq(null)}>
+                Cancel
+              </Button>
+              <Button type="button" size="sm" disabled={!eq.value.trim() || !eqOk} onClick={commitEquation}>
+                {eq.editId ? "Update" : "Add to board"}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Floating SmartBoard AI Chat Bar (Bottom Center) */}
+        {!readOnly && (
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 w-full max-w-xl px-4 z-40 pointer-events-none flex flex-col gap-2">
+            {chatMessages.length > 0 && showChat && (
+              <div className={cn(
+                "backdrop-blur-md rounded-2xl shadow-2xl border p-4 max-h-[360px] overflow-y-auto pointer-events-auto flex flex-col gap-2.5 mb-1 transition-colors",
+                theme === "dark" ? "bg-zinc-950/90 border-zinc-800 text-white" : "bg-white/95 border-gray-200 text-gray-900"
+              )}>
+                <div className="flex justify-between items-center border-b pb-1.5 border-[var(--color-border)]">
+                  <span className="text-xs font-bold uppercase tracking-wider text-gray-400">SmartBoard AI Assistant</span>
+                  <button
+                    type="button"
+                    onClick={() => setShowChat(false)}
+                    className="text-gray-400 hover:text-gray-600 rounded p-0.5"
+                    aria-label="Close Chat"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+                {chatMessages.map((msg) => (
+                  <div key={msg.id} className={cn("flex", msg.role === "user" ? "justify-end" : "justify-start")}>
+                    <div className={cn(
+                      "max-w-[85%] p-2.5 rounded-2xl text-xs sm:text-sm leading-relaxed shadow-sm",
+                      msg.role === "user"
+                        ? "bg-blue-600 text-white rounded-tr-sm"
+                        : (theme === "dark" ? "bg-zinc-800 text-zinc-100 border border-zinc-700 rounded-tl-sm" : "bg-gray-100 text-gray-800 border border-gray-200 rounded-tl-sm")
+                    )}>
+                      {msg.role === "model" ? <ReactMarkdown>{msg.text}</ReactMarkdown> : msg.text}
+                    </div>
+                  </div>
+                ))}
+                <div ref={chatEndRef} />
+              </div>
+            )}
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (chatInputText.trim() && !isChatProcessing && !isRecordingChat) {
+                  void sendChatMessage(chatInputText)
+                }
+              }}
+              className={cn(
+                "pointer-events-auto flex items-center gap-2 backdrop-blur-md p-1.5 px-3 rounded-full shadow-2xl border transition-all",
+                theme === "dark" ? "bg-zinc-900/90 border-zinc-700 shadow-black/40" : "bg-white/95 border-gray-200 shadow-xl"
+              )}
+            >
+              <button
+                type="button"
+                onClick={() => setShowChat(!showChat)}
+                className="text-gray-400 hover:text-blue-500 transition-colors p-1"
+                title="Toggle AI Chat History"
+                aria-label="Toggle AI Chat History"
+              >
+                <MessageSquare size={18} />
+              </button>
+
+              <input
+                type="text"
+                value={chatInputText}
+                onChange={(e) => setChatInputText(e.target.value)}
+                placeholder={isRecordingChat ? "Recording voice note..." : "Ask Gemini to draw, simulate, or explain…"}
+                disabled={isChatProcessing || isRecordingChat}
+                className={cn(
+                  "flex-1 bg-transparent border-none outline-none text-xs sm:text-sm py-1.5 px-1 placeholder-gray-400",
+                  theme === "dark" ? "text-white" : "text-gray-900"
+                )}
+              />
+
+              <button
+                type="button"
+                onClick={handleMicClick}
+                disabled={isChatProcessing}
+                className={cn(
+                  "p-1.5 rounded-full transition-all",
+                  isRecordingChat ? "bg-red-500 text-white animate-pulse" : "text-gray-400 hover:bg-gray-100 dark:hover:bg-zinc-800"
+                )}
+                title={isRecordingChat ? "Stop Recording" : "Voice Message"}
+                aria-label={isRecordingChat ? "Stop Recording" : "Voice Message"}
+              >
+                {isRecordingChat ? <Square size={16} fill="currentColor" /> : <Mic size={16} />}
+              </button>
+
+              <button
+                type="submit"
+                disabled={!chatInputText.trim() || isChatProcessing || isRecordingChat}
+                className={cn(
+                  "p-1.5 rounded-full transition-all flex items-center justify-center",
+                  !chatInputText.trim() || isChatProcessing
+                    ? "bg-gray-200 dark:bg-zinc-800 text-gray-400 cursor-not-allowed"
+                    : "bg-blue-600 text-white hover:bg-blue-700 shadow-sm"
+                )}
+                title="Send to SmartBoard"
+                aria-label="Send to SmartBoard"
+              >
+                {isChatProcessing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+              </button>
+            </form>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+})

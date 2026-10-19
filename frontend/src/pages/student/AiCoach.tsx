@@ -126,7 +126,7 @@ export default function AiCoach() {
   return (
     <AppShell
       role="student"
-      mainClassName={mode === "board" ? "p-1 sm:p-2 flex flex-col flex-1 min-h-0 h-full" : undefined}
+      mainClassName={mode === "board" ? "p-0 flex flex-col flex-1 h-[calc(100dvh-3.5rem)] overflow-hidden" : undefined}
       crumbs={[
         { label: "Courses", to: "/student/courses" },
         { label: course.data?.course.name ?? "Course", to: `/student/courses/${courseId}` },
@@ -136,7 +136,7 @@ export default function AiCoach() {
     >
       <QueryState query={assignmentQ} what="Assignment">
         {(assignment) => (
-          <div className={cn("mx-auto flex flex-col overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-white transition-all duration-300", mode === "board" ? "w-full max-w-none flex-1 h-[calc(100dvh-4.25rem)] min-h-[32rem]" : "max-w-3xl h-[calc(100dvh-8.5rem)] min-h-[26rem]")}>
+          <div className={cn("flex flex-col overflow-hidden bg-white transition-all duration-300", mode === "board" ? "w-full h-full border-none rounded-none flex-1" : "mx-auto max-w-3xl rounded-[var(--radius-lg)] border border-[var(--color-border)] h-[calc(100dvh-8.5rem)] min-h-[26rem]")}>
             <div className={cn("flex items-center justify-between gap-3 border-b border-[var(--color-border)]", mode === "board" ? "px-4 py-2" : "px-5 py-3")}>
               <div className="min-w-0 flex items-center gap-3">
                 <div>
@@ -178,8 +178,8 @@ export default function AiCoach() {
               </div>
             )}
             {savedBoard && (
-              <div className={cn("min-h-0 flex-1", mode !== "board" && "hidden")}>
-                <BoardWorkspace ref={boardApi} assignmentId={assignmentId} initial={savedBoard} readOnly={closed} busy={!!thinking} onAsk={(intent, message) => void handleSend(message, intent)} />
+              <div className={cn("min-h-0 flex-1 h-full", mode !== "board" && "hidden")}>
+                <BoardWorkspace ref={boardApi} assignmentId={assignmentId} courseId={courseId} initial={savedBoard} readOnly={closed} busy={!!thinking} onAsk={(intent, message) => void handleSend(message, intent)} />
               </div>
             )}
 

@@ -9,21 +9,35 @@ import { ASK_ACTIONS, type BoardIntent } from "@/lib/boardAsk"
 import { saveWhiteboard } from "@/lib/queries"
 import {
   BOARD_W, BOARD_H, LIMITS, addElement, commit, fromLegacy, fromServer, nextSeq, redo, removeElement, startHistory, toWire, undo, updateElement,
-  type Board, type History, type BoardElement,
+  type Board, type History, type BoardElement, type Stroke,
 } from "@/lib/whiteboard"
 import {
   generateImageContent,
   generateSimulationCode,
   generateVectorDrawing,
   sendChatProxy,
+  retrieveCourseMaterials,
   getLiveWebSocketUrl
 } from "@/lib/geminiSmartBoardService"
+import { accessToken } from "@/lib/api"
 import {
   MODEL_NAMES,
   whiteboardTools,
   SMARTBOARD_SYSTEM_INSTRUCTION
 } from "@/lib/smartboardConstants"
 import { getSmartPlacement } from "@/lib/smartPlacement"
+import {
+  estimateContentDimensions,
+  findCollisionFreePosition,
+  computeArrowEndpoints,
+  readBoardState,
+  verifyAndReflowLayout,
+  planBatchLayout,
+} from "@/lib/boardLayoutEngine"
+import {
+  BoardInteractionTracker,
+  type StrokeInteraction,
+} from "@/lib/interactionUnderstanding"
 import { cn } from "@/lib/utils"
 
 export interface BoardApi {
@@ -34,6 +48,7 @@ export interface BoardApi {
 
 interface Props {
   assignmentId: string
+  courseId?: string
   initial: Board
   readOnly?: boolean
   busy: boolean
@@ -120,7 +135,7 @@ function createBlob(data: Float32Array): { data: string; mimeType: string } {
   }
 }
 
-export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspace({ assignmentId, initial, readOnly = false, busy, onAsk }, ref) {
+export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspace({ assignmentId, courseId, initial, readOnly = false, busy, onAsk }, ref) {
   const [seed] = useState(() => fromLegacy(initial))
   const [hist, setHist] = useState<History>(() => startHistory(seed))
   const [tool, setTool] = useState<Tool>("select")
@@ -147,7 +162,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
   const [isAIProcessing, setIsAIProcessing] = useState(false)
 
   // Floating SmartBoard AI Chat State
-  const [chatMessages, setChatMessages] = useState<Array<{ id: string; role: "user" | "model"; text: string; audio?: string; mimeType?: string }>>([])
+  const [chatMessages, setChatMessages] = useState<Array<{ id: string; role: "user" | "model"; text: string; audio?: string; mimeType?: string; sources?: Array<{ source?: string; title?: string; page?: number; score?: number }> }>>([])
   const [chatInputText, setChatInputText] = useState("")
   const [isChatProcessing, setIsChatProcessing] = useState(false)
   const [showChat, setShowChat] = useState(false)
@@ -174,6 +189,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
   const nextStartTime = useRef<number>(0)
   const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([])
   const captureIntervalRef = useRef<number | undefined>(undefined)
+  const interactionTracker = useRef<BoardInteractionTracker>(new BoardInteractionTracker())
 
   const flushRef = useRef<() => Promise<boolean>>(async () => true)
   const flush = useCallback(async (): Promise<boolean> => {
@@ -276,7 +292,48 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
     if (targetEl.fontSize) setFontSize(targetEl.fontSize)
   }, [])
 
+  const handleStrokeCompleted = useCallback((stroke: Stroke, nextBoard: Board) => {
+    const interaction = interactionTracker.current.recordStroke(stroke, nextBoard)
+    if (liveWsRef.current && liveWsRef.current.readyState === WebSocket.OPEN) {
+      liveWsRef.current.send(JSON.stringify({
+        realtimeInput: {
+          text: `[BOARD UPDATE]: ${interaction.summary}`
+        }
+      }))
+      // If student performed a selection, underline, or circle, send fresh JPEG frame immediately
+      if (interaction.type === "circle" || interaction.type === "underline" || interaction.type === "cross_out" || interaction.target) {
+        smartBoardRef.current?.getScreenCapture().then((b64) => {
+          if (b64 && liveWsRef.current && liveWsRef.current.readyState === WebSocket.OPEN) {
+            const cleanB64 = b64.includes(",") ? b64.split(",")[1] : b64
+            liveWsRef.current.send(JSON.stringify({
+              realtimeInput: {
+                video: {
+                  data: cleanB64,
+                  mimeType: "image/jpeg",
+                },
+              },
+            }))
+          }
+        })
+      }
+    }
+  }, [])
+
+  const handleElementMoved = useCallback((id: string, newBox: { x: number; y: number; w: number; h: number }) => {
+    interactionTracker.current.recordElementMoved(id, newBox)
+  }, [])
+
   const doUndo = useCallback(() => {
+    interactionTracker.current.recordUndo()
+    if (liveWsRef.current && liveWsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        liveWsRef.current.send(JSON.stringify({
+          realtimeInput: {
+            text: "[BOARD UPDATE]: Student undid their last action."
+          }
+        }))
+      } catch {}
+    }
     setHist((h) => {
       const n = undo(h)
       latest.current = n.present
@@ -286,6 +343,16 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
   }, [schedule])
 
   const doRedo = useCallback(() => {
+    interactionTracker.current.recordRedo()
+    if (liveWsRef.current && liveWsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        liveWsRef.current.send(JSON.stringify({
+          realtimeInput: {
+            text: "[BOARD UPDATE]: Student redid their last action."
+          }
+        }))
+      } catch {}
+    }
     setHist((h) => {
       const n = redo(h)
       latest.current = n.present
@@ -671,11 +738,18 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
     const normalizeCoords = (x?: number, y?: number, w = 300, h = 100, currentBoard?: Board) => {
       const boardToUse = currentBoard || latest.current
       if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y) || (x === 0 && y === 0)) {
-        return getSmartPlacement(boardToUse, viewState, w, h, sel.current)
+        const preferredPos = sel.current
+          ? (() => {
+              const s = boardToUse.elements.find((e) => e.id === sel.current)
+              return s ? { x: s.x + s.w + 30, y: s.y } : undefined
+            })()
+          : (viewState.x ? { x: Math.max(30, -viewState.x + 80), y: Math.max(30, -viewState.y + 80) } : undefined)
+        return findCollisionFreePosition(boardToUse, w, h, preferredPos, [], viewState)
       }
       const clampedX = Math.round(Math.max(20, Math.min(BOARD_W - w - 20, x)))
       const clampedY = Math.round(Math.max(20, Math.min(BOARD_H - h - 20, y)))
-      return { x: clampedX, y: clampedY }
+      // Step 5: Validate collision against student work and all existing elements
+      return findCollisionFreePosition(boardToUse, w, h, { x: clampedX, y: clampedY }, [], viewState)
     }
 
     for (const fc of functionCalls) {
@@ -687,7 +761,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
         : rawName === "delete" ? "delete_element_at"
         : rawName
       const args = fc.args || fc.parameters || {}
-      let result = { result: "ok" }
+      let result: Record<string, any> = { result: "ok" }
       const id = "ai_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
 
       try {
@@ -697,14 +771,22 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
         } else if (name === "delete_element_at") {
           const target = latest.current.elements.find((el) => Math.hypot(el.x + el.w / 2 - args.x, el.y + el.h / 2 - args.y) < 120)
           if (target) {
-            toDeleteIds.add(target.id)
-            result = { result: "Element deleted." }
+            if (target.author === "student") {
+              result = { error: "Cannot delete student-authored work; student work is protected." }
+            } else {
+              toDeleteIds.add(target.id)
+              result = { result: "Element deleted." }
+            }
           }
         } else if (name === "move_element_at") {
           const target = latest.current.elements.find((el) => Math.hypot(el.x + el.w / 2 - args.x, el.y + el.h / 2 - args.y) < 120)
           if (target) {
-            toMove.push({ id: target.id, x: args.new_x, y: args.new_y })
-            result = { result: "Element moved." }
+            if (target.author === "student") {
+              result = { error: "Cannot move student-authored work; student work is protected." }
+            } else {
+              toMove.push({ id: target.id, x: args.new_x, y: args.new_y })
+              result = { result: "Element moved." }
+            }
           }
         } else if (name === "draw_rectangle") {
           const w = args.width || 120
@@ -787,26 +869,46 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             strokeWidth: args.strokeWidth || 3,
           })
         } else if (name === "draw_arrow") {
+          let x1 = args.x1 ?? 100
+          let y1 = args.y1 ?? 100
+          let x2 = args.x2 ?? 200
+          let y2 = args.y2 ?? 200
+          if (args.from_element_id && args.to_element_id) {
+            const allEls = [...latest.current.elements, ...addedElements]
+            const fromEl = allEls.find((e) => e.id === args.from_element_id)
+            const toEl = allEls.find((e) => e.id === args.to_element_id)
+            if (fromEl && toEl) {
+              const arrowPts = computeArrowEndpoints(
+                { x: fromEl.x, y: fromEl.y, w: fromEl.w, h: fromEl.h },
+                { x: toEl.x, y: toEl.y, w: toEl.w, h: toEl.h }
+              )
+              x1 = arrowPts.x1
+              y1 = arrowPts.y1
+              x2 = arrowPts.x2
+              y2 = arrowPts.y2
+            }
+          }
           addedElements.push({
             id,
             kind: "arrow",
             author: "coach",
             seq: 0,
-            x: Math.min(args.x1 ?? 100, args.x2 ?? 200),
-            y: Math.min(args.y1 ?? 100, args.y2 ?? 200),
-            w: Math.abs((args.x2 ?? 200) - (args.x1 ?? 100)),
-            h: Math.abs((args.y2 ?? 200) - (args.y1 ?? 100)),
-            x2: args.x2 ?? 200,
-            y2: args.y2 ?? 200,
+            x: Math.min(x1, x2),
+            y: Math.min(y1, y2),
+            w: Math.max(10, Math.abs(x2 - x1)),
+            h: Math.max(10, Math.abs(y2 - y1)),
+            x2,
+            y2,
             color: args.color || "#2563eb",
             strokeWidth: args.strokeWidth || 4,
           })
         } else if (name === "write_text") {
+          const dims = estimateContentDimensions({ kind: "text", text: args.text, fontSize: 28 })
           const currentBoardState: Board = {
             ...latest.current,
             elements: [...latest.current.elements, ...addedElements],
           }
-          const targetPos = normalizeCoords(args.x, args.y, 400, 80, currentBoardState)
+          const targetPos = normalizeCoords(args.x, args.y, dims.w, dims.h, currentBoardState)
           addedElements.push({
             id,
             kind: "text",
@@ -814,18 +916,19 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             seq: 0,
             x: targetPos.x,
             y: targetPos.y,
-            w: 400,
-            h: 80,
+            w: dims.w,
+            h: dims.h,
             text: args.text,
             color: args.color || "#000000",
             fontSize: 28,
           })
         } else if (name === "add_equation") {
+          const dims = estimateContentDimensions({ kind: "equation", latex: args.latex })
           const currentBoardState: Board = {
             ...latest.current,
             elements: [...latest.current.elements, ...addedElements],
           }
-          const targetPos = normalizeCoords(args.x, args.y, 350, 90, currentBoardState)
+          const targetPos = normalizeCoords(args.x, args.y, dims.w, dims.h, currentBoardState)
           addedElements.push({
             id,
             kind: "equation",
@@ -833,8 +936,8 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             seq: 0,
             x: targetPos.x,
             y: targetPos.y,
-            w: 350,
-            h: 90,
+            w: dims.w,
+            h: dims.h,
             latex: args.latex,
             color: args.color || "#000000",
           })
@@ -873,6 +976,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
           })
         } else if (name === "clear_board") {
           shouldClear = true
+          result = { result: "Cleared coach elements; preserved student work and notes." }
         } else if (name === "generate_image") {
           const w = 360
           const h = 270
@@ -957,6 +1061,64 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
               change({ ...latest.current, elements: [...latest.current.elements, ...newShapes] })
             }
           })
+        } else if (name === "search_course_materials") {
+          const query = args.query || ""
+          try {
+            const chunks = await retrieveCourseMaterials(
+              query,
+              assignmentId || undefined,
+              courseId || undefined,
+              args.top_k || 3
+            )
+            if (chunks && chunks.length > 0) {
+              result = {
+                results: chunks.map((r: any) => ({
+                  title: r.document_title || r.source,
+                  page: r.page_number,
+                  content: (r.content || "").slice(0, 500),
+                })),
+              } as any
+            } else {
+              result = { results: [], message: "No relevant materials found in the course index for this query." } as any
+            }
+          } catch (err: any) {
+            result = { error: "Failed to search materials", details: err?.message || String(err) } as any
+          }
+        } else if (name === "get_board_context") {
+          const analysis = readBoardState(latest.current)
+          const recentInteractions = interactionTracker.current.getRecentInteractions()
+          const latestSel = interactionTracker.current.getLatestSelection()
+          const summary = smartBoardRef.current?.getBoardSummary() || ""
+
+          result = {
+            elementCount: latest.current.elements.length,
+            elements: latest.current.elements.map((e) => ({
+              id: e.id,
+              type: e.kind,
+              author: e.author,
+              x: Math.round(e.x),
+              y: Math.round(e.y),
+              w: Math.round(e.w),
+              h: Math.round(e.h),
+              text: (e as any).text || (e as any).title || (e as any).latex || "",
+            })),
+            studentElements: analysis.studentElements.map((e) => ({
+              id: e.id,
+              type: e.kind,
+              text: e.text || e.latex || "",
+            })),
+            selectedId: sel.current || null,
+            latestSelection: latestSel,
+            recentInteractions: recentInteractions.map((i) => ({
+              type: i.type,
+              summary: i.summary,
+              isAmbiguous: i.isAmbiguous,
+              target: i.target,
+            })),
+            realtimeInteractionSummary: interactionTracker.current.getRealtimeSummary(),
+            boardOccupancySummary: analysis.summary,
+            boardSummaryText: summary,
+          } as any
         }
       } catch (e) {
         console.error(e)
@@ -966,7 +1128,10 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
     }
 
     if (shouldClear || addedElements.length > 0 || toDeleteIds.size > 0 || toMove.length > 0) {
-      let next = shouldClear ? [] : [...latest.current.elements]
+      // Protect student work: clear_board only clears coach elements, preserving student work
+      let next = shouldClear
+        ? latest.current.elements.filter((e) => e.author === "student")
+        : [...latest.current.elements]
       if (toDeleteIds.size > 0) next = next.filter((e) => !toDeleteIds.has(e.id))
       if (toMove.length > 0) {
         next = next.map((e) => {
@@ -976,6 +1141,19 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       }
       next = [...next, ...addedElements]
       change({ ...latest.current, elements: next })
+
+      // Step 6: Post-render verification & reflow if DOM dimensions caused unexpected overlaps
+      setTimeout(() => {
+        if (smartBoardRef.current) {
+          const renderedBounds = smartBoardRef.current.getAllRenderedBounds()
+          if (renderedBounds.size > 0) {
+            const { needsReflow, updatedElements } = verifyAndReflowLayout(latest.current, renderedBounds)
+            if (needsReflow) {
+              change({ ...latest.current, elements: updatedElements })
+            }
+          }
+        }
+      }, 60)
     }
     return responses
   }
@@ -1027,8 +1205,19 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       const ws = new WebSocket(wsUrl)
       liveWsRef.current = ws
 
-      ws.onopen = () => {
+      ws.onopen = async () => {
+        let token: string | null = null
+        try {
+          if (typeof accessToken === "function") {
+            token = await accessToken()
+          }
+        } catch {
+          // Token unavailable in test environment or offline
+        }
         const setup = {
+          token: token || undefined,
+          assignment_id: assignmentId || undefined,
+          course_id: courseId || undefined,
           setup: {
             model: `models/${MODEL_NAMES.LIVE}`,
             generationConfig: {
@@ -1295,17 +1484,40 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
         }
       }
 
+      const realtimeSummary = interactionTracker.current.getRealtimeSummary()
+      if (realtimeSummary && realtimeSummary !== "No recent student interactions.") {
+        systemInstruction += `\n\n[RECENT STUDENT BOARD INTERACTIONS]: ${realtimeSummary}`
+      }
+      const latestSel = interactionTracker.current.getLatestSelection()
+      if (latestSel && latestSel.mcqOption) {
+        systemInstruction += `\n[STUDENT FREEHAND SELECTION]: The student circled Option ${latestSel.mcqOption}${latestSel.mcqText ? ` ("${latestSel.mcqText}")` : ""}. Address their selection directly, validate or question their reasoning Socratically, and do NOT give away the final answer immediately.`
+      }
+
       const result = await sendChatProxy(
         payloadMessages,
         b64Screen || null,
         whiteboardTools,
-        systemInstruction
+        systemInstruction,
+        {
+          assignmentId: assignmentId || undefined,
+          courseId: courseId || undefined,
+          board: latest.current,
+          selectedId: sel.current || undefined,
+        }
       )
 
       if (result.error) throw new Error(result.error)
 
       if (result.text) {
-        setChatMessages((prev) => [...prev, { id: Date.now().toString(), role: "model", text: result.text }])
+        setChatMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now().toString(),
+            role: "model",
+            text: result.text,
+            sources: result.sources || undefined,
+          },
+        ])
       }
 
       if (result.functionCalls && result.functionCalls.length > 0) {
@@ -1487,6 +1699,8 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
           viewState={viewState}
           onViewChange={setViewState}
           onToolChange={handleToolChange}
+          onStrokeCompleted={handleStrokeCompleted}
+          onElementMoved={handleElementMoved}
           onEquationRequest={(at, editId) => {
             const el = editId ? board.elements.find((e) => e.id === editId) : undefined
             setEq({ ...at, editId, value: el?.latex ?? "" })
@@ -1551,7 +1765,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
                   </button>
                 </div>
                 {chatMessages.map((msg) => (
-                  <div key={msg.id} className={cn("flex", msg.role === "user" ? "justify-end" : "justify-start")}>
+                  <div key={msg.id} className={cn("flex flex-col", msg.role === "user" ? "items-end" : "items-start")}>
                     <div className={cn(
                       "max-w-[85%] p-2.5 rounded-2xl text-xs sm:text-sm leading-relaxed shadow-sm",
                       msg.role === "user"
@@ -1559,6 +1773,16 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
                         : (theme === "dark" ? "bg-zinc-800 text-zinc-100 border border-zinc-700 rounded-tl-sm" : "bg-gray-100 text-gray-800 border border-gray-200 rounded-tl-sm")
                     )}>
                       {msg.role === "model" ? <ReactMarkdown>{msg.text}</ReactMarkdown> : msg.text}
+                      {msg.sources && msg.sources.length > 0 && (
+                        <div className="mt-2 pt-1.5 border-t border-gray-300 dark:border-zinc-700 flex flex-wrap gap-1 text-[10px]">
+                          <span className="font-semibold text-gray-500 dark:text-zinc-400">Sources:</span>
+                          {msg.sources.map((s, idx) => (
+                            <span key={idx} className="bg-blue-50 dark:bg-zinc-700/60 text-blue-700 dark:text-blue-300 px-1.5 py-0.5 rounded border border-blue-200 dark:border-zinc-600">
+                              {s.title || s.source}{s.page ? ` (p. ${s.page})` : ""}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}

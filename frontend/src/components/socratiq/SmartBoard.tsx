@@ -104,10 +104,16 @@ interface Props {
   viewState?: ViewState
   onViewChange?: (view: ViewState) => void
   onToolChange?: (tool: Tool) => void
+  onStrokeCompleted?: (stroke: Stroke, newBoard: Board) => void
+  onElementMoved?: (id: string, newBox: { x: number; y: number; w: number; h: number }) => void
 }
 
 export interface SmartBoardHandle {
   getScreenCapture: () => Promise<string | null>
+  getBoardSummary: () => string
+  getStructuredElements: () => BoardElement[]
+  getElementRenderedBounds: (id: string) => { x: number; y: number; w: number; h: number } | null
+  getAllRenderedBounds: () => Map<string, { x: number; y: number; w: number; h: number }>
 }
 
 export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function SmartBoard({
@@ -133,6 +139,8 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
   viewState,
   onViewChange,
   onToolChange,
+  onStrokeCompleted,
+  onElementMoved,
 }: Props, ref) {
   const viewport = useRef<HTMLDivElement>(null)
   const stage = useRef<HTMLDivElement>(null)
@@ -180,16 +188,18 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
         img.crossOrigin = "anonymous"
         img.onload = () => {
           const offscreen = document.createElement("canvas")
-          const maxWidth = 512
+          const maxWidth = 1024
           const scale = Math.min(1, maxWidth / BOARD_W)
-          offscreen.width = BOARD_W * scale
-          offscreen.height = BOARD_H * scale
+          offscreen.width = Math.round(BOARD_W * scale)
+          offscreen.height = Math.round(BOARD_H * scale)
           const ctx = offscreen.getContext("2d")
           if (!ctx) {
             URL.revokeObjectURL(url)
             resolve(null)
             return
           }
+          ctx.imageSmoothingEnabled = true
+          ctx.imageSmoothingQuality = "high"
           ctx.fillStyle = theme === "dark" ? "#171717" : "#ffffff"
           ctx.fillRect(0, 0, offscreen.width, offscreen.height)
           if (canvas.current) {
@@ -198,7 +208,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
           ctx.drawImage(img, 0, 0, offscreen.width, offscreen.height)
 
           try {
-            const base64 = offscreen.toDataURL("image/jpeg", 0.6).split(",")[1]
+            const base64 = offscreen.toDataURL("image/jpeg", 0.78).split(",")[1]
             URL.revokeObjectURL(url)
             resolve(base64)
           } catch {
@@ -217,9 +227,67 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
     }
   }, [theme])
 
+  const getBoardSummary = useCallback((): string => {
+    if (!board.elements.length) return "The board has no elements yet."
+    const items = board.elements.slice(0, 40).map((e, idx) => {
+      let desc = `${idx + 1}. [${e.kind.toUpperCase()}] id="${e.id}" pos=(${e.x},${e.y}) size=${e.w}x${e.h} by=${e.author}`
+      if (e.text) desc += ` text="${e.text.slice(0, 80)}"`
+      if (e.latex) desc += ` latex="${e.latex.slice(0, 80)}"`
+      if (e.title) desc += ` title="${e.title}"`
+      if (e.rotation) desc += ` rot=${e.rotation}°`
+      if (selectedId === e.id) desc += " [CURRENTLY SELECTED]"
+      return desc
+    })
+    return items.join("\n")
+  }, [board.elements, selectedId])
+
+  const getStructuredElements = useCallback((): BoardElement[] => {
+    return board.elements
+  }, [board.elements])
+
+  const getElementRenderedBounds = useCallback((id: string) => {
+    if (!stage.current) return null
+    const domNode = stage.current.querySelector<HTMLElement>(`[data-element-id="${id}"]`)
+    if (!domNode) return null
+    const stageRect = stage.current.getBoundingClientRect()
+    const nodeRect = domNode.getBoundingClientRect()
+    const scale = internalScale > 0 ? internalScale : 1
+    return {
+      x: Math.round((nodeRect.left - stageRect.left) / scale),
+      y: Math.round((nodeRect.top - stageRect.top) / scale),
+      w: Math.round(nodeRect.width / scale),
+      h: Math.round(nodeRect.height / scale),
+    }
+  }, [internalScale])
+
+  const getAllRenderedBounds = useCallback((): Map<string, { x: number; y: number; w: number; h: number }> => {
+    const map = new Map<string, { x: number; y: number; w: number; h: number }>()
+    if (!stage.current) return map
+    const nodes = stage.current.querySelectorAll<HTMLElement>("[data-element-id]")
+    const stageRect = stage.current.getBoundingClientRect()
+    const scale = internalScale > 0 ? internalScale : 1
+    nodes.forEach((node) => {
+      const id = node.getAttribute("data-element-id")
+      if (id) {
+        const rect = node.getBoundingClientRect()
+        map.set(id, {
+          x: Math.round((rect.left - stageRect.left) / scale),
+          y: Math.round((rect.top - stageRect.top) / scale),
+          w: Math.round(rect.width / scale),
+          h: Math.round(rect.height / scale),
+        })
+      }
+    })
+    return map
+  }, [internalScale])
+
   React.useImperativeHandle(ref, () => ({
     getScreenCapture,
-  }), [getScreenCapture])
+    getBoardSummary,
+    getStructuredElements,
+    getElementRenderedBounds,
+    getAllRenderedBounds,
+  }), [getScreenCapture, getBoardSummary, getStructuredElements, getElementRenderedBounds, getAllRenderedBounds])
 
   const [internalSelectedIds, setInternalSelectedIds] = useState<string[]>([])
 
@@ -387,7 +455,9 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
         pts: simplify(s.pts),
         color: s.t === "e" ? undefined : (s.color || currentColor || (s.t === "h" ? "#facc15" : INK)),
       }
-      onChange({ ...board, strokes: [...board.strokes, completedStroke] })
+      const nextBoard = { ...board, strokes: [...board.strokes, completedStroke] }
+      onChange(nextBoard)
+      onStrokeCompleted?.(completedStroke, nextBoard)
       return
     }
 
@@ -524,6 +594,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
           if (activeSelectedSet.has(el.id)) {
             const nextX = Math.max(0, Math.min(BOARD_W - el.w, el.x + dx))
             const nextY = Math.max(0, Math.min(BOARD_H - el.h, el.y + dy))
+            onElementMoved?.(el.id, { x: nextX, y: nextY, w: el.w, h: el.h })
             const deltaActualX = nextX - el.x
             const deltaActualY = nextY - el.y
             const nextEl: BoardElement = {
@@ -541,6 +612,10 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
         })
         onChange({ ...board, elements: updated })
       } else if (dragPos) {
+        const movedEl = board.elements.find((e) => e.id === d.id)
+        if (movedEl) {
+          onElementMoved?.(d.id, { x: dragPos.x, y: dragPos.y, w: movedEl.w, h: movedEl.h })
+        }
         onChange(moveElement(board, d.id, dragPos.x, dragPos.y))
       }
     }

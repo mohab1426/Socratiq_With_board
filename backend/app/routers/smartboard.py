@@ -16,9 +16,15 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import websockets
+
+from ..access import allowed_document_ids, coach_application_context, student_assignment, student_course
+from ..auth import CurrentUser
+from ..db import Database, many, one
+from ai.rag.models import RetrievalScope
+from ai.rag.security import sanitize_untrusted_text
 
 log = logging.getLogger("socratiq.smartboard")
 
@@ -47,6 +53,36 @@ def _get_gemini_key() -> Optional[str]:
     return keys[0] if keys else None
 
 
+def _authenticate_token(token: str, app: Any) -> Optional[CurrentUser]:
+    if not token or not token.strip():
+        return None
+    try:
+        verifier = getattr(app.state, "token_verifier", None)
+        if not verifier:
+            return None
+        identity = verifier.verify(token.strip())
+        db = getattr(app.state, "db", None)
+        if not db:
+            return None
+        with db.tx() as c:
+            row = one(c, "SELECT user_id, auth_user_id::text AS auth_user_id, university_id, role, email, first_name, last_name FROM users WHERE auth_user_id = %s",
+                      (identity.auth_user_id,))
+            if row:
+                return CurrentUser(**row)
+    except Exception as exc:
+        log.warning("SmartBoard token authentication failed: %s", exc)
+        return None
+    return None
+
+
+def _authenticate_request(request: Request) -> Optional[CurrentUser]:
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return _authenticate_token(token.strip(), request.app)
+
+
 class ImageGenIn(BaseModel):
     prompt: str
     size: str = "1K"
@@ -72,12 +108,145 @@ class ChatIn(BaseModel):
     screenshot: Optional[str] = None
     tools: Optional[List[Dict[str, Any]]] = None
     systemInstruction: Optional[str] = None
+    assignment_id: Optional[str] = None
+    course_id: Optional[str] = None
+    board: Optional[Dict[str, Any]] = None
+    selected_id: Optional[str] = None
+    board_intent: Optional[str] = None
+
+
+class RetrieveIn(BaseModel):
+    query: str
+    assignment_id: Optional[str] = None
+    course_id: Optional[str] = None
+    top_k: int = 4
 
 
 @router.get("/config")
 def get_config():
     key = _get_gemini_key()
     return {"status": "online" if key else "no_key"}
+
+
+@router.get("/context")
+async def get_smartboard_context(
+    request: Request,
+    assignment_id: Optional[str] = None,
+    course_id: Optional[str] = None
+):
+    db = getattr(request.app.state, "db", None)
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    user = _authenticate_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required for educational context")
+
+    with db.tx() as c:
+        if assignment_id:
+            try:
+                a = student_assignment(c, user, assignment_id)
+            except Exception:
+                raise HTTPException(status_code=404, detail="Assignment not found or not accessible")
+            allowed_docs = allowed_document_ids(c, a)
+            app_ctx = coach_application_context(c, a)
+            return {
+                "assignment": {
+                    "assignment_id": a["assignment_id"],
+                    "title": a["title"],
+                    "instructions": a["instructions"],
+                    "subject_area": a.get("subject_area"),
+                    "is_programming": a.get("is_programming"),
+                    "concepts": app_ctx.get("concepts", []),
+                    "attachments": app_ctx.get("attachments", []),
+                    "materials": app_ctx.get("materials", []),
+                },
+                "course": {
+                    "course_id": a["course_id"],
+                    "title": app_ctx.get("course_title"),
+                    "code": app_ctx.get("course_code"),
+                },
+                "allowed_documents_count": len(allowed_docs)
+            }
+        elif course_id:
+            try:
+                course = student_course(c, user, course_id)
+            except Exception:
+                raise HTTPException(status_code=404, detail="Course not found or not accessible")
+            return {
+                "course": {
+                    "course_id": course["course_id"],
+                    "title": course.get("title") or course.get("name"),
+                    "code": course.get("code"),
+                }
+            }
+        else:
+            raise HTTPException(status_code=400, detail="assignment_id or course_id required")
+
+
+@router.post("/retrieve")
+async def retrieve_materials(request: Request, body: RetrieveIn):
+    db = getattr(request.app.state, "db", None)
+    if not db:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    user = _authenticate_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    rag_service = getattr(getattr(request.app.state, "pipeline", None), "rag", None)
+    if not rag_service:
+        return {"results": []}
+
+    with db.tx() as c:
+        if body.assignment_id:
+            try:
+                a = student_assignment(c, user, body.assignment_id)
+            except Exception:
+                raise HTTPException(status_code=404, detail="Assignment not found or not accessible")
+            course_id = a["course_id"]
+            classroom_id = a.get("classroom_id")
+            allowed_docs = allowed_document_ids(c, a)
+        elif body.course_id:
+            try:
+                course = student_course(c, user, body.course_id)
+            except Exception:
+                raise HTTPException(status_code=404, detail="Course not found or not accessible")
+            course_id = body.course_id
+            classroom_id = course.get("classroom_id")
+            docs = many(c, """
+                SELECT f.document_id FROM stored_files f
+                 WHERE f.document_id IS NOT NULL AND f.status = 'READY' AND f.university_id = %s AND f.course_id = %s
+                   AND f.purpose = 'MATERIAL' AND EXISTS (
+                        SELECT 1 FROM enrollments e WHERE e.student_id = %s AND e.classroom_id = f.classroom_id AND e.status = 'active')
+            """, (user.university_id, course_id, user.user_id))
+            allowed_docs = sorted({r["document_id"] for r in docs})
+        else:
+            raise HTTPException(status_code=400, detail="assignment_id or course_id required")
+
+    scope = RetrievalScope(
+        university_id=user.university_id,
+        course_id=course_id,
+        classroom_id=classroom_id,
+        assignment_id=body.assignment_id,
+        allowed_document_ids=allowed_docs or ()
+    )
+    chunks = rag_service.retrieve_course_material(
+        course_id=course_id,
+        query=body.query,
+        top_k=body.top_k,
+        scope=scope
+    )
+    results = []
+    for r in chunks:
+        meta = r.metadata if isinstance(r.metadata, dict) else {}
+        results.append({
+            "source": r.source,
+            "content": sanitize_untrusted_text(r.content),
+            "document_title": meta.get("document_title") or meta.get("title") or r.source,
+            "page_number": meta.get("page_number"),
+            "section": meta.get("section"),
+            "score": meta.get("score", 1.0)
+        })
+    return {"results": results}
 
 
 @router.post("/generate-image")
@@ -206,10 +375,141 @@ async def generate_vector(body: VectorGenIn):
 
 
 @router.post("/chat")
-async def chat(body: ChatIn):
+async def chat(request: Request, body: ChatIn):
     key = _get_gemini_key()
     if not key:
         raise HTTPException(status_code=503, detail="Gemini API key is not configured")
+
+    db = getattr(request.app.state, "db", None)
+    user = None
+    a = None
+    course = None
+    allowed_docs: list[str] = []
+    app_ctx: dict[str, Any] = {}
+    sources: list[dict[str, Any]] = []
+    rag_contexts: list[str] = []
+
+    # If assignment or course context is provided, authenticate and verify access
+    if body.assignment_id or body.course_id:
+        if not db:
+            raise HTTPException(status_code=503, detail="Database not configured")
+        user = _authenticate_request(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required when accessing assignment or course context")
+
+        with db.tx() as c:
+            if body.assignment_id:
+                try:
+                    a = student_assignment(c, user, body.assignment_id)
+                except Exception:
+                    raise HTTPException(status_code=404, detail="Assignment not found or not accessible")
+                allowed_docs = allowed_document_ids(c, a)
+                app_ctx = coach_application_context(c, a)
+                course_id = a["course_id"]
+                classroom_id = a.get("classroom_id")
+            elif body.course_id:
+                try:
+                    course = student_course(c, user, body.course_id)
+                except Exception:
+                    raise HTTPException(status_code=404, detail="Course not found or not accessible")
+                course_id = body.course_id
+                classroom_id = course.get("classroom_id")
+                docs = many(c, """
+                    SELECT f.document_id FROM stored_files f
+                     WHERE f.document_id IS NOT NULL AND f.status = 'READY' AND f.university_id = %s AND f.course_id = %s
+                       AND f.purpose = 'MATERIAL' AND EXISTS (
+                            SELECT 1 FROM enrollments e WHERE e.student_id = %s AND e.classroom_id = f.classroom_id AND e.status = 'active')
+                """, (user.university_id, course_id, user.user_id))
+                allowed_docs = sorted({r["document_id"] for r in docs})
+
+        # Grounding: Retrieve course material chunks matching the student's query
+        rag_service = getattr(getattr(request.app.state, "pipeline", None), "rag", None)
+        user_texts = [m.text for m in body.messages if m.role == "user" and m.text]
+        query = user_texts[-1] if user_texts else ""
+
+        if query and rag_service and (allowed_docs or body.course_id):
+            scope = RetrievalScope(
+                university_id=user.university_id,
+                course_id=course_id,
+                classroom_id=classroom_id,
+                assignment_id=body.assignment_id,
+                allowed_document_ids=allowed_docs or ()
+            )
+            try:
+                chunks = rag_service.retrieve_course_material(
+                    course_id=course_id,
+                    query=query,
+                    top_k=4,
+                    scope=scope
+                )
+                for r in chunks:
+                    meta = r.metadata if isinstance(r.metadata, dict) else {}
+                    doc_title = meta.get("document_title") or meta.get("title") or r.source
+                    page = meta.get("page_number")
+                    sources.append({
+                        "source": r.source,
+                        "title": doc_title,
+                        "page": page,
+                        "score": meta.get("score", 1.0)
+                    })
+                    loc = f" (Page {page})" if page else ""
+                    rag_contexts.append(f"[{doc_title}{loc}]: {sanitize_untrusted_text(r.content)}")
+            except Exception as exc:
+                log.warning("SmartBoard chat RAG retrieval failed: %s", exc)
+
+    # Build contextual enrichment blocks
+    context_blocks = []
+    if a:
+        context_blocks.append(
+            f"--- ASSIGNMENT CONTEXT ---\n"
+            f"Course: {app_ctx.get('course_title') or a.get('course_title', '')} ({app_ctx.get('course_code') or a.get('course_code', '')})\n"
+            f"Assignment Title: {a.get('title')}\n"
+            f"Instructions: {a.get('instructions') or 'None'}\n"
+            f"Subject Area: {a.get('subject_area') or 'General'}\n"
+            f"Core Concepts: {', '.join(app_ctx.get('concepts', [])) or 'None specified'}\n"
+            f"Key Attachments: {', '.join(att.get('filename', '') for att in app_ctx.get('attachments', [])) or 'None'}\n"
+            f"Available Materials: {', '.join(m.get('title', '') for m in app_ctx.get('materials', [])) or 'None'}"
+        )
+    elif course:
+        context_blocks.append(
+            f"--- COURSE CONTEXT ---\n"
+            f"Course: {course.get('title') or course.get('name', '')} ({course.get('code', '')})"
+        )
+
+    if rag_contexts:
+        context_blocks.append(
+            "--- RELEVANT COURSE MATERIALS & LECTURE NOTES ---\n"
+            + "\n\n".join(rag_contexts)
+            + "\n\nInstruction: Use the above course materials to guide your explanations, cite concepts and page numbers when relevant, and ensure your terminology directly matches what the instructor taught."
+        )
+
+    if body.board:
+        elements = body.board.get("elements", [])
+        if isinstance(elements, list) and elements:
+            summary_lines = []
+            for el in elements[:40]:
+                el_type = el.get("kind") or el.get("type", "element")
+                el_text = el.get("text") or el.get("title") or el.get("latex") or el.get("caption") or ""
+                pos = f"at ({int(el.get('x', 0))}, {int(el.get('y', 0))})"
+                sel = " [SELECTED BY STUDENT]" if str(el.get("id")) == str(body.selected_id) else ""
+                summary_lines.append(f"- {el_type}{sel} {pos}: {el_text[:60]}")
+            context_blocks.append(
+                f"--- STUDENT'S CURRENT SMARTBOARD WORK ({len(elements)} items) ---\n"
+                + "\n".join(summary_lines)
+                + (f"\n(Currently selected element: {body.selected_id})" if body.selected_id else "")
+            )
+
+    pedagogy_and_language = (
+        "--- PEDAGOGICAL POLICY & LANGUAGE DIRECTIVE ---\n"
+        "1. You are the SocratiQ AI Learning Companion on this SmartBoard.\n"
+        "2. LANGUAGE: Default strictly to speaking and writing in English. Only switch to Arabic if the student explicitly addresses you in Arabic. Never speak Spanish.\n"
+        "3. SOCRATIC COACHING: Help the student learn by asking guiding questions, breaking problems down, and illustrating key concepts visually on the board. Do not simply give away full solutions to assignment questions.\n"
+        "4. VISUAL BOARD INTERACTION: When helpful, place diagrams, concept notes, cards, or shapes onto empty areas of the board without overlapping existing content."
+    )
+    context_blocks.append(pedagogy_and_language)
+
+    base_sys = body.systemInstruction or "You are the SocratiQ AI Learning Companion on this SmartBoard."
+    enriched_system_instruction = base_sys + "\n\n" + "\n\n".join(context_blocks)
 
     contents = []
     for m in body.messages:
@@ -246,14 +546,13 @@ async def chat(body: ChatIn):
     config: Dict[str, Any] = {}
     if body.tools:
         config["tools"] = [{"functionDeclarations": body.tools}]
-    if body.systemInstruction:
-        config["systemInstruction"] = {"parts": [{"text": body.systemInstruction}]}
+    config["systemInstruction"] = {"parts": [{"text": enriched_system_instruction}]}
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{SMARTBOARD_MODEL}:generateContent?key={key}"
     payload = {
         "contents": contents,
         **({"tools": config["tools"]} if "tools" in config else {}),
-        **({"systemInstruction": config["systemInstruction"]} if "systemInstruction" in config else {})
+        "systemInstruction": config["systemInstruction"]
     }
 
     import httpx
@@ -294,7 +593,7 @@ async def chat(body: ChatIn):
         except (KeyError, IndexError):
             pass
 
-        return {"text": reply_text, "functionCalls": function_calls}
+        return {"text": reply_text, "functionCalls": function_calls, "sources": sources}
 
 
 @router.websocket("/live")
@@ -317,15 +616,76 @@ async def live_relay(client_ws: WebSocket):
         await client_ws.close(code=1008, reason="Missing setup message")
         return
 
+    raw_payload_text = setup_text or (setup_bytes.decode("utf-8") if isinstance(setup_bytes, bytes) else "")
+    parsed_client_payload: Dict[str, Any] = {}
+    try:
+        parsed_client_payload = json.loads(raw_payload_text)
+    except Exception:
+        pass
+
+    # Extract optional authentication token and context identifiers
+    token = parsed_client_payload.pop("token", None) if isinstance(parsed_client_payload, dict) else None
+    assignment_id = parsed_client_payload.pop("assignment_id", None) if isinstance(parsed_client_payload, dict) else None
+    course_id = parsed_client_payload.pop("course_id", None) if isinstance(parsed_client_payload, dict) else None
+
+    # Retrieve core Gemini setup dict (client may send {"setup": {...}} or flat setup payload)
+    setup_body = parsed_client_payload.get("setup", parsed_client_payload) if isinstance(parsed_client_payload, dict) else {}
+
+    # Enforce authentication if assignment_id was specified
+    if assignment_id:
+        if not token:
+            await client_ws.close(code=1008, reason="Authentication token required for assignment live session")
+            return
+        user = _authenticate_token(token, client_ws.app)
+        if not user:
+            await client_ws.close(code=1008, reason="Authentication failed")
+            return
+
+        db = getattr(client_ws.app.state, "db", None)
+        if db:
+            with db.tx() as c:
+                try:
+                    a = student_assignment(c, user, assignment_id)
+                    app_ctx = coach_application_context(c, a)
+                    assignment_text = (
+                        f"\n--- ASSIGNMENT CONTEXT ---\n"
+                        f"Course: {app_ctx.get('course_title', '')} ({app_ctx.get('course_code', '')})\n"
+                        f"Assignment Title: {a.get('title')}\n"
+                        f"Instructions: {a.get('instructions') or 'None'}\n"
+                        f"Concepts: {', '.join(app_ctx.get('concepts', []))}\n"
+                    )
+                    sys_inst = setup_body.setdefault("systemInstruction", {}).setdefault("parts", [])
+                    sys_inst.append({"text": assignment_text})
+                except Exception as exc:
+                    log.warning("Live relay assignment authorization failed: %s", exc)
+                    await client_ws.close(code=1008, reason="Assignment access denied")
+                    return
+    elif token:
+        # User provided token without specific assignment (general course or student live session)
+        user = _authenticate_token(token, client_ws.app)
+        if not user:
+            await client_ws.close(code=1008, reason="Authentication failed")
+            return
+
+    # Strictly enforce English default language policy in setup instructions
+    language_directive = (
+        "\n--- LANGUAGE DIRECTIVE ---\n"
+        "Always speak in English by default. Do not speak Spanish. "
+        "Only switch to Arabic if the student explicitly addresses you in Arabic."
+    )
+    if isinstance(setup_body, dict):
+        sys_inst = setup_body.setdefault("systemInstruction", {}).setdefault("parts", [])
+        sys_inst.append({"text": language_directive})
+
+    # Prepare cleaned setup payload to send upstream to Google (no auth tokens or internal metadata)
+    cleaned_setup_msg = json.dumps({"setup": setup_body} if "model" in setup_body else setup_body)
+
     connected_ws = None
     for key in keys:
         google_url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={key}"
         try:
             g_ws = await websockets.connect(google_url)
-            if setup_text:
-                await g_ws.send(setup_text)
-            else:
-                await g_ws.send(setup_bytes)
+            await g_ws.send(cleaned_setup_msg)
             ack = await asyncio.wait_for(g_ws.recv(), timeout=5)
             if isinstance(ack, bytes):
                 try:
@@ -400,3 +760,4 @@ async def live_relay(client_ws: WebSocket):
             await client_ws.close()
         except Exception:
             pass
+

@@ -26,7 +26,7 @@ export function camelize<T>(value: unknown): T {
   return value as T
 }
 
-async function accessToken(): Promise<string | null> {
+export async function accessToken(): Promise<string | null> {
   const { data } = await supabase.auth.getSession()
   return data.session?.access_token ?? null
 }

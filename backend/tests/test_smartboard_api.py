@@ -213,3 +213,217 @@ def test_save_whiteboard_oversized_payload_returns_413():
         assert r.status_code == 413
         assert r.json()["error"]["code"] == "board_too_large"
 
+
+def test_smartboard_context_unauthenticated():
+    db = MagicMock()
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=MagicMock(), run_worker=False)
+    client = TestClient(app)
+    r = client.get("/api/v1/smartboard/context?assignment_id=A1")
+    assert r.status_code == 401
+    assert "Authentication required" in r.json()["detail"]
+
+
+def test_smartboard_context_authenticated_student():
+    from backend.app.auth import CurrentUser
+    db = MagicMock()
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=MagicMock(), run_worker=False)
+    student = CurrentUser(
+        user_id="s1",
+        auth_user_id="auth_s1",
+        university_id="u1",
+        role="STUDENT",
+        email="student@test.com",
+        first_name="Jane",
+        last_name="Doe",
+    )
+    with patch("backend.app.routers.smartboard._authenticate_request", return_value=student):
+        with patch("backend.app.routers.smartboard.student_assignment", return_value={
+            "assignment_id": "A1",
+            "course_id": "C1",
+            "title": "Quantum Mechanics Problem Set",
+            "instructions": "Solve Schrödinger equation for 1D infinite well",
+            "subject_area": "Physics",
+            "is_programming": False,
+        }):
+            with patch("backend.app.routers.smartboard.allowed_document_ids", return_value=["doc1", "doc2"]):
+                with patch("backend.app.routers.smartboard.coach_application_context", return_value={
+                    "course_title": "Modern Physics",
+                    "course_code": "PHYS201",
+                    "concepts": ["Wavefunction", "Infinite Well"],
+                    "attachments": [{"filename": "ps1.pdf", "role": "PROBLEM_SET"}],
+                    "materials": [{"title": "Lecture 3 Notes", "file_type": "pdf", "searchable": True}],
+                }):
+                    client = TestClient(app)
+                    r = client.get(
+                        "/api/v1/smartboard/context?assignment_id=A1",
+                        headers={"Authorization": "Bearer valid_token"}
+                    )
+                    assert r.status_code == 200
+                    data = r.json()
+                    assert data["assignment"]["title"] == "Quantum Mechanics Problem Set"
+                    assert data["assignment"]["instructions"] == "Solve Schrödinger equation for 1D infinite well"
+                    assert "Wavefunction" in data["assignment"]["concepts"]
+                    assert data["course"]["code"] == "PHYS201"
+                    assert data["allowed_documents_count"] == 2
+
+
+def test_smartboard_context_cross_student_access_denied():
+    from backend.app.auth import CurrentUser
+    from backend.app.errors import not_found
+    db = MagicMock()
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=MagicMock(), run_worker=False)
+    student = CurrentUser(
+        user_id="s1",
+        auth_user_id="auth_s1",
+        university_id="u1",
+        role="STUDENT",
+        email="student@test.com",
+        first_name="Jane",
+        last_name="Doe",
+    )
+    with patch("backend.app.routers.smartboard._authenticate_request", return_value=student):
+        with patch("backend.app.routers.smartboard.student_assignment", side_effect=not_found("Assignment not found")):
+            client = TestClient(app)
+            r = client.get(
+                "/api/v1/smartboard/context?assignment_id=OTHER_STUDENT_ASSIGNMENT",
+                headers={"Authorization": "Bearer valid_token"}
+            )
+            assert r.status_code == 404
+
+
+def test_smartboard_retrieve_scoped_materials():
+    from backend.app.auth import CurrentUser
+    from ai.models.schemas import RetrievedContext
+    db = MagicMock()
+    mock_rag = MagicMock()
+    mock_rag.retrieve_course_material.return_value = [
+        RetrievedContext(
+            source="lecture_notes_ch2.pdf",
+            content="The boundary condition requires psi(0) = 0 and psi(L) = 0.",
+            metadata={"document_title": "Chapter 2: Quantum Wells", "page_number": 14, "score": 0.92}
+        )
+    ]
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=mock_rag, run_worker=False)
+    student = CurrentUser(
+        user_id="s1",
+        auth_user_id="auth_s1",
+        university_id="u1",
+        role="STUDENT",
+        email="student@test.com",
+        first_name="Jane",
+        last_name="Doe",
+    )
+    with patch("backend.app.routers.smartboard._authenticate_request", return_value=student):
+        with patch("backend.app.routers.smartboard.student_assignment", return_value={
+            "assignment_id": "A1",
+            "course_id": "C1",
+            "classroom_id": "K1",
+            "title": "Quantum Mechanics",
+        }):
+            with patch("backend.app.routers.smartboard.allowed_document_ids", return_value=["doc1"]):
+                client = TestClient(app)
+                r = client.post(
+                    "/api/v1/smartboard/retrieve",
+                    json={"query": "boundary conditions", "assignment_id": "A1", "top_k": 3},
+                    headers={"Authorization": "Bearer valid_token"}
+                )
+                assert r.status_code == 200
+                res = r.json()["results"]
+                assert len(res) == 1
+                assert res[0]["document_title"] == "Chapter 2: Quantum Wells"
+                assert res[0]["page_number"] == 14
+                assert "psi(0) = 0" in res[0]["content"]
+
+                # Verify RAG was called with scoped allowed_document_ids
+                call_args = mock_rag.retrieve_course_material.call_args
+                assert call_args[1]["course_id"] == "C1"
+                assert call_args[1]["query"] == "boundary conditions"
+                scope = call_args[1]["scope"]
+                assert scope.university_id == "u1"
+                assert scope.allowed_document_ids == ("doc1",)
+
+
+def test_smartboard_chat_educational_grounding_and_sources():
+    from backend.app.auth import CurrentUser
+    from ai.models.schemas import RetrievedContext
+    db = MagicMock()
+    mock_rag = MagicMock()
+    mock_rag.retrieve_course_material.return_value = [
+        RetrievedContext(
+            source="lecture_waves.pdf",
+            content="Nodes occur where the amplitude of the standing wave is zero.",
+            metadata={"document_title": "Lecture Notes: Wave Mechanics", "page_number": 8, "score": 0.88}
+        )
+    ]
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=mock_rag, run_worker=False)
+    student = CurrentUser(
+        user_id="s1",
+        auth_user_id="auth_s1",
+        university_id="u1",
+        role="STUDENT",
+        email="student@test.com",
+        first_name="Jane",
+        last_name="Doe",
+    )
+    with patch("backend.app.routers.smartboard._get_gemini_key", return_value="fake_key"):
+        with patch("backend.app.routers.smartboard._authenticate_request", return_value=student):
+            with patch("backend.app.routers.smartboard.student_assignment", return_value={
+                "assignment_id": "A1",
+                "course_id": "C1",
+                "classroom_id": "K1",
+                "title": "Quantum Waves",
+                "instructions": "Explain wave nodes",
+            }):
+                with patch("backend.app.routers.smartboard.allowed_document_ids", return_value=["doc1"]):
+                    with patch("backend.app.routers.smartboard.coach_application_context", return_value={
+                        "course_title": "Physics 2",
+                        "course_code": "PHYS202",
+                        "concepts": ["Standing Waves", "Nodes"],
+                        "attachments": [],
+                        "materials": [],
+                    }):
+                        with patch("httpx.AsyncClient.post") as mock_post:
+                            mock_post.return_value = MagicMock(
+                                status_code=200,
+                                json=lambda: {
+                                    "candidates": [
+                                        {
+                                            "content": {
+                                                "parts": [{"text": "As explained in Lecture Notes: Wave Mechanics (Page 8), nodes are points of zero amplitude."}]
+                                            }
+                                        }
+                                    ]
+                                }
+                            )
+                            client = TestClient(app)
+                            r = client.post(
+                                "/api/v1/smartboard/chat",
+                                json={
+                                    "messages": [{"role": "user", "text": "What is a node in a standing wave?"}],
+                                    "assignment_id": "A1",
+                                    "board": {
+                                        "elements": [
+                                            {"id": "el1", "kind": "text", "text": "Wave nodes", "x": 100, "y": 100, "w": 200, "h": 50}
+                                        ]
+                                    }
+                                },
+                                headers={"Authorization": "Bearer valid_token"}
+                            )
+                            assert r.status_code == 200
+                            data = r.json()
+                            assert "Lecture Notes: Wave Mechanics" in data["text"]
+                            assert len(data["sources"]) == 1
+                            assert data["sources"][0]["title"] == "Lecture Notes: Wave Mechanics"
+                            assert data["sources"][0]["page"] == 8
+
+                            # Verify that enriched systemInstruction was sent to Gemini with English directive & course context
+                            called_payload = mock_post.call_args[1]["json"]
+                            sys_text = called_payload["systemInstruction"]["parts"][0]["text"]
+                            assert "LANGUAGE DIRECTIVE" in sys_text
+                            assert "Default strictly to speaking and writing in English" in sys_text
+                            assert "ASSIGNMENT CONTEXT" in sys_text
+                            assert "Quantum Waves" in sys_text
+                            assert "RELEVANT COURSE MATERIALS & LECTURE NOTES" in sys_text
+                            assert "STUDENT'S CURRENT SMARTBOARD WORK" in sys_text
+
+

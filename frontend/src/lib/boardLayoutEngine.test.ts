@@ -201,6 +201,82 @@ describe("boardLayoutEngine", () => {
       // Coach element must be shifted down to resolve collision (100 + 90 + 20 = 210)
       expect(coachEl.y).toBeGreaterThanOrEqual(210)
     })
+
+    it("updates arrow endpoints when connected coach elements reflow", () => {
+      const board: Board = {
+        ...EMPTY_BOARD,
+        elements: [
+          { id: "s1", kind: "text", author: "student", seq: 1, x: 100, y: 100, w: 200, h: 60, text: "Student problem" },
+          { id: "c1", kind: "shape", author: "coach", seq: 2, x: 100, y: 170, w: 200, h: 80, shape: "rect" },
+          {
+            id: "a1",
+            kind: "arrow",
+            author: "coach",
+            seq: 3,
+            x: 100,
+            y: 250,
+            w: 10,
+            h: 50,
+            x2: 100,
+            y2: 300,
+            fromId: "c1",
+            toId: "c2",
+          },
+          { id: "c2", kind: "shape", author: "coach", seq: 4, x: 100, y: 300, w: 200, h: 80, shape: "rect" },
+        ],
+      }
+
+      // Student box expands downwards to h: 100, forcing c1 to shift down
+      const actualBounds: Record<string, RectBox> = {
+        s1: { x: 100, y: 100, w: 200, h: 100 },
+        c1: { x: 100, y: 170, w: 200, h: 80 },
+        c2: { x: 100, y: 300, w: 200, h: 80 },
+      }
+
+      const { needsReflow, updatedElements } = verifyAndReflowLayout(board, actualBounds, 20)
+      expect(needsReflow).toBe(true)
+
+      const c1 = updatedElements.find((e) => e.id === "c1")!
+      const a1 = updatedElements.find((e) => e.id === "a1")!
+      const c2 = updatedElements.find((e) => e.id === "c2")!
+
+      // c1 must be shifted down below s1 (100 + 100 + 20 = 220)
+      expect(c1.y).toBeGreaterThanOrEqual(220)
+      // c2 must also be shifted down below c1
+      expect(c2.y).toBeGreaterThanOrEqual(c1.y + c1.h + 20)
+      // Arrow endpoints must be updated to bridge the shifted elements
+      expect(a1.y).toBeGreaterThanOrEqual(c1.y)
+    })
+  })
+
+  describe("typography hierarchy and multi-column expansion", () => {
+    it("assigns appropriate font sizes for headings, body, and annotations", () => {
+      const heading = estimateContentDimensions({ kind: "text", text: "# Key Concept", role: "heading" })
+      expect(heading.fontSize).toBe(32)
+
+      const shortTitle = estimateContentDimensions({ kind: "text", text: "Step 1: Understand the Goal" })
+      expect(shortTitle.fontSize).toBe(32)
+
+      const body = estimateContentDimensions({ kind: "text", text: "Here is a standard paragraph of explanation." })
+      expect(body.fontSize).toBe(24)
+
+      const note = estimateContentDimensions({ kind: "text", text: "Note: keep in mind x > 0", role: "annotation" })
+      expect(note.fontSize).toBe(18)
+    })
+
+    it("wraps to next column when vertical space in current column is full", () => {
+      // Occupy column 1 with tall boxes
+      const boardWithTallContent: Board = {
+        ...EMPTY_BOARD,
+        elements: [
+          { id: "e1", kind: "shape", author: "student", seq: 1, x: 32, y: 32, w: 500, h: 1100, shape: "rect" },
+        ],
+      }
+
+      const pos = findCollisionFreePosition(boardWithTallContent, 300, 200)
+      // Because column 1 (x: 32) is filled to y: 1132, the position should advance to an adjacent column
+      expect(pos.x).toBeGreaterThanOrEqual(300)
+    })
   })
 })
 

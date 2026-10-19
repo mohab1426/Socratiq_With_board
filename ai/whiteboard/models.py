@@ -56,6 +56,8 @@ class BoardElement(BaseModel):
     title: Optional[str] = None
     font_size: Optional[float] = Field(default=None, alias="fontSize")
     is_loading: Optional[bool] = Field(default=False, alias="isLoading")
+    original_author: Optional[str] = Field(default=None, alias="originalAuthor")
+    student_modified: Optional[bool] = Field(default=None, alias="studentModified")
 
     @model_validator(mode="after")
     def _by_kind(self):

@@ -22,7 +22,9 @@ import websockets
 
 from ..access import allowed_document_ids, coach_application_context, student_assignment, student_course
 from ..auth import CurrentUser
-from ..db import Database, many, one
+from ..board_auth import sign_coach_element_id
+from ..db import Database, many, new_id, one
+from ..records import insert_event
 from ai.rag.models import RetrievalScope
 from ai.rag.security import sanitize_untrusted_text
 
@@ -593,6 +595,61 @@ async def chat(request: Request, body: ChatIn):
         except (KeyError, IndexError):
             pass
 
+        # Persist interaction telemetry for teacher dashboard & analytics and issue signed coach element IDs
+        if db and user and a:
+            try:
+                with db.tx() as c:
+                    att = one(c, "SELECT * FROM attempts WHERE student_id=%s AND assignment_id=%s AND status IN ('DRAFT','IN_PROGRESS') ORDER BY attempt_number DESC LIMIT 1",
+                              (user.user_id, a["assignment_id"]))
+                    if att:
+                        coach_element_ids = []
+                        for fc in function_calls:
+                            el_id = sign_coach_element_id(att["attempt_id"])
+                            fc["element_id"] = el_id
+                            if "functionCall" in fc:
+                                fc["functionCall"]["element_id"] = el_id
+                            coach_element_ids.append(el_id)
+
+                        sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att["attempt_id"],))
+                        if sess is None:
+                            sess_id = new_id("ses")
+                            c.execute("""INSERT INTO ai_sessions (session_id, student_id, assignment_id, attempt_id, policy, university_id)
+                                         VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                                      (sess_id, user.user_id, a["assignment_id"], att["attempt_id"], a.get("default_policy") or "SOCRATIC", user.university_id))
+                            sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att["attempt_id"],))
+
+                        if sess:
+                            interaction_id = new_id("int")
+                            tool_names = [fc["functionCall"]["name"] for fc in function_calls if "functionCall" in fc and "name" in fc["functionCall"]]
+                            c.execute("""INSERT INTO ai_interactions (interaction_id, session_id, student_id, assignment_id, intervention_type, assistance_level, diagnosis,
+                                            diagnosis_confidence, diagnosis_explanation, diagnosis_evidence, response, referenced_concepts, tools_used, university_id)
+                                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)""",
+                                      (interaction_id, sess["session_id"], user.user_id, a["assignment_id"],
+                                       "SMARTBOARD_GUIDANCE", "SUGGESTION", "GUIDED_PRACTICE", 0.9,
+                                       "SmartBoard AI collaborative interaction", "Interactive whiteboard exploration",
+                                       reply_text or "SmartBoard action", json.dumps([]), json.dumps(tool_names), user.university_id))
+
+                            last_user_text = next((m.text for m in reversed(body.messages) if m.role == "user" and m.text), "SmartBoard interaction")
+                            c.execute("INSERT INTO messages (message_id, session_id, sender, content, created_at) VALUES (%s,%s,'STUDENT',%s, clock_timestamp())",
+                                      (new_id("msg"), sess["session_id"], last_user_text))
+                            c.execute("INSERT INTO messages (message_id, session_id, sender, content, interaction_id, created_at) VALUES (%s,%s,'COACH',%s,%s, clock_timestamp())",
+                                      (new_id("msg"), sess["session_id"], reply_text or "SmartBoard whiteboard update", interaction_id))
+
+                            insert_event(c, student_id=user.user_id, university_id=user.university_id, event_type="AI_INTERACTION",
+                                         assignment_id=a["assignment_id"], session_id=sess["session_id"], attempt_id=att["attempt_id"],
+                                         interaction_id=interaction_id,
+                                         payload={
+                                             "intervention": "SMARTBOARD_GUIDANCE",
+                                             "tools_used": tool_names,
+                                             "coach_element_ids": coach_element_ids,
+                                             "sources": len(sources),
+                                             "mode": "smartboard",
+                                             "channel": "chat"
+                                         })
+                            c.execute("UPDATE ai_sessions SET turn_count = turn_count + 1 WHERE session_id=%s", (sess["session_id"],))
+            except Exception as e:
+                log.warning("Failed to record SmartBoard telemetry: %s", e)
+
         return {"text": reply_text, "functionCalls": function_calls, "sources": sources}
 
 
@@ -642,10 +699,15 @@ async def live_relay(client_ws: WebSocket):
             return
 
         db = getattr(client_ws.app.state, "db", None)
+        att_id = None
         if db:
             with db.tx() as c:
                 try:
                     a = student_assignment(c, user, assignment_id)
+                    att = one(c, "SELECT * FROM attempts WHERE student_id=%s AND assignment_id=%s AND status IN ('DRAFT','IN_PROGRESS') ORDER BY attempt_number DESC LIMIT 1",
+                              (user.user_id, assignment_id))
+                    if att:
+                        att_id = att["attempt_id"]
                     app_ctx = coach_application_context(c, a)
                     assignment_text = (
                         f"\n--- ASSIGNMENT CONTEXT ---\n"
@@ -666,6 +728,7 @@ async def live_relay(client_ws: WebSocket):
         if not user:
             await client_ws.close(code=1008, reason="Authentication failed")
             return
+        att_id = None
 
     # Strictly enforce English default language policy in setup instructions
     language_directive = (
@@ -709,6 +772,8 @@ async def live_relay(client_ws: WebSocket):
 
     google_ws = connected_ws
     stop_event = asyncio.Event()
+    live_coach_ids: list[str] = []
+    live_tools_used: list[str] = []
 
     async def client_to_google():
         try:
@@ -730,6 +795,34 @@ async def live_relay(client_ws: WebSocket):
             async for message in google_ws:
                 if stop_event.is_set():
                     break
+                raw_text = None
+                if isinstance(message, str):
+                    raw_text = message
+                elif isinstance(message, bytes):
+                    try:
+                        raw_text = message.decode("utf-8")
+                    except UnicodeDecodeError:
+                        raw_text = None
+
+                # If the message contains function calls and we have an open attempt, stamp signed element_id
+                if raw_text and att_id:
+                    try:
+                        parsed = json.loads(raw_text)
+                        tc = parsed.get("toolCall")
+                        if tc and isinstance(tc, dict) and "functionCalls" in tc:
+                            for fc in tc["functionCalls"]:
+                                el_id = sign_coach_element_id(att_id)
+                                fc["element_id"] = el_id
+                                live_coach_ids.append(el_id)
+                                live_tools_used.append(fc.get("name", "unknown"))
+                            raw_text = json.dumps(parsed)
+                            if isinstance(message, bytes):
+                                message = raw_text.encode("utf-8")
+                            else:
+                                message = raw_text
+                    except Exception:
+                        pass
+
                 if isinstance(message, bytes):
                     try:
                         await client_ws.send_text(message.decode("utf-8"))
@@ -760,4 +853,39 @@ async def live_relay(client_ws: WebSocket):
             await client_ws.close()
         except Exception:
             pass
+
+        # Record Live Voice interaction telemetry on session completion
+        if db and user and assignment_id and att_id:
+            try:
+                with db.tx() as c:
+                    sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att_id,))
+                    if sess is None:
+                        sess_id = new_id("ses")
+                        c.execute("""INSERT INTO ai_sessions (session_id, student_id, assignment_id, attempt_id, policy, university_id)
+                                     VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                                  (sess_id, user.user_id, assignment_id, att_id, "SOCRATIC", user.university_id))
+                        sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att_id,))
+                    if sess:
+                        interaction_id = new_id("int")
+                        c.execute("""INSERT INTO ai_interactions (interaction_id, session_id, student_id, assignment_id, intervention_type, assistance_level, diagnosis,
+                                        diagnosis_confidence, diagnosis_explanation, diagnosis_evidence, response, referenced_concepts, tools_used, university_id)
+                                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)""",
+                                  (interaction_id, sess["session_id"], user.user_id, assignment_id,
+                                   "SMARTBOARD_GUIDANCE", "SUGGESTION", "GUIDED_PRACTICE", 0.9,
+                                   "SmartBoard Live Voice interaction", "Interactive live voice exploration",
+                                   "SmartBoard Live Voice session", json.dumps([]), json.dumps(live_tools_used), user.university_id))
+                        insert_event(c, student_id=user.user_id, university_id=user.university_id, event_type="AI_INTERACTION",
+                                     assignment_id=assignment_id, session_id=sess["session_id"], attempt_id=att_id,
+                                     interaction_id=interaction_id,
+                                     payload={
+                                         "intervention": "SMARTBOARD_GUIDANCE",
+                                         "tools_used": live_tools_used,
+                                         "coach_element_ids": live_coach_ids,
+                                         "sources": 0,
+                                         "mode": "smartboard",
+                                         "channel": "live"
+                                     })
+                        c.execute("UPDATE ai_sessions SET turn_count = turn_count + 1 WHERE session_id=%s", (sess["session_id"],))
+            except Exception as e:
+                log.warning("Failed to record Live telemetry on disconnect: %s", e)
 

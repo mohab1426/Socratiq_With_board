@@ -9,6 +9,7 @@ from psycopg import errors as pgerr
 
 from ..access import student_assignment, student_attempt, student_course
 from ..auth import CurrentUser, get_db, require_student
+from ..board_auth import is_registered_coach_element, verify_coach_element_id
 from ..config import get_backend_config
 from ..db import Database, many, new_id, one
 from ..errors import AppError, conflict, not_found
@@ -171,13 +172,44 @@ def save_whiteboard(assignment_id: str, body: WhiteboardIn, user: CurrentUser = 
     with db.tx() as c:
         att = _open_attempt_for(c, user, assignment_id, lock=True)
         board = body.model_dump(mode="json", exclude_none=True)
-        # Authorship is decided by the SERVER, never by the client: an element stays "coach" only if it was already coach-written and its
-        # content is unchanged; anything new or edited by the student is student-authored. (Teachers read authorship as evidence.)
+        # Authorship is decided strictly by trusted SERVER evidence, never by arbitrary client claims:
+        # 1. Existing coach elements with unchanged content stay "coach".
+        # 2. Existing coach elements modified by the student become author "student", with provenance preserved (original_author: "coach", student_modified: True).
+        # 3. New elements can only be author "coach" if their ID bears a valid server HMAC signature for this attempt or was registered in learning_events.
+        # 4. Student elements cannot masquerade as coach elements under any circumstances.
         prev = {e["id"]: e for e in ((att.get("whiteboard") or {}).get("elements") or [])}
         for e in board["elements"]:
             p = prev.get(e["id"])
-            same = p is not None and p.get("kind") == e["kind"] and p.get("text") == e.get("text") and p.get("latex") == e.get("latex")
-            e["author"] = "coach" if (same and p.get("author") == "coach") else "student"
+            if p is not None:
+                if p.get("author") == "coach":
+                    same = p.get("kind") == e.get("kind") and p.get("text") == e.get("text") and p.get("latex") == e.get("latex") and p.get("shape") == e.get("shape")
+                    if same:
+                        e["author"] = "coach"
+                        e["original_author"] = "coach"
+                    else:
+                        e["author"] = "student"
+                        e["original_author"] = "coach"
+                        e["student_modified"] = True
+                else:
+                    e["author"] = "student"
+                    if p.get("original_author") == "coach":
+                        e["original_author"] = "coach"
+                        e["student_modified"] = True
+                    else:
+                        e.pop("original_author", None)
+                        e.pop("student_modified", None)
+            else:
+                claimed_coach = e.get("author") == "coach"
+                if claimed_coach and (
+                    verify_coach_element_id(att["attempt_id"], e.get("id"))
+                    or is_registered_coach_element(c, att["attempt_id"], e.get("id"))
+                ):
+                    e["author"] = "coach"
+                    e["original_author"] = "coach"
+                else:
+                    e["author"] = "student"
+                    e.pop("original_author", None)
+                    e.pop("student_modified", None)
         board["next_seq"] = max(board.get("next_seq", 0), max((e["seq"] + 1 for e in board["elements"]), default=0), (att.get("whiteboard") or {}).get("next_seq", 0))
         serialized = json.dumps(board)
         if len(serialized.encode("utf-8")) > 380_000:

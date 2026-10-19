@@ -12,13 +12,18 @@ from ai.verification.models import (
 )
 from ai.verification.strategies.base import BaseVerificationStrategy
 
-_CHALLENGE_SYSTEM = """You are an expert pedagogy system designing an 'Adaptation / Modification' verification question.
-Given a student's work on an assignment, propose a specific variation, constraint change, or edge case involving concept ({concept}).
-Ask them what modifications they would need to make to their solution and why.
+_CHALLENGE_SYSTEM = """You are an expert pedagogy system designing a concise 'Adaptation / Modification' verification question.
+Given a student's work on an assignment, change one condition or assumption involving concept ({concept}) and ask what changes.
 
 Requirements:
-- Propose a realistic modification (e.g. changing an assumption, optimizing for memory, handling negative inputs).
-- Ask how their approach or code would change.
+- Change exactly one condition or assumption and ask what changes in their solution or outcome.
+- Target the concept specifically: {concept}.
+- Length constraint: Prefer 5–12 words per question whenever practical.
+- Ask only one thing. Avoid compound questions, unnecessary context, and long hypothetical scenarios.
+- Require a short answer, ideally one sentence or a few words.
+- Adapt the question to the student's actual work and lesson context.
+- Distinctness: Must test what changes under a modified condition, distinct from explaining the concept (Explain) or applying it to a new domain (Transfer).
+- Do NOT make it multiple choice.
 - Define 2-3 clear criteria for what constitutes a valid modification.
 """
 
@@ -26,10 +31,10 @@ _EVALUATION_SYSTEM = """You are an expert pedagogical evaluator assessing a stud
 Determine whether the student understands how changing constraints impacts their implementation and conceptual model.
 
 Evaluation Outcomes:
-- PASS: The student correctly identified the necessary changes and accurately explained the rationale.
+- PASS: The student correctly identified the necessary change and rationale. Note: Concise, accurate answers (a single sentence or a few words) must be awarded PASS if conceptually sound.
 - PARTIAL: The student identified some changes but missed a key detail or side effect.
-- NEEDS_RETRY: The student's proposed modification breaks the logic or reveals a misconception.
-- INSUFFICIENT_EVIDENCE: The response is evasive, off-topic, or too vague to evaluate.
+- NEEDS_RETRY: The student's proposed modification breaks the logic or reveals a fundamental misconception.
+- INSUFFICIENT_EVIDENCE: The response is evasive, completely off-topic, or empty. Do NOT flag a response as insufficient evidence simply because it is concise or only one sentence.
 
 Scoring:
 - PASS: score >= 0.8

@@ -30,6 +30,7 @@ import {
   estimateContentDimensions,
   findCollisionFreePosition,
   computeArrowEndpoints,
+  getElementBoundingBox,
   readBoardState,
   verifyAndReflowLayout,
   planBatchLayout,
@@ -752,7 +753,36 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       return findCollisionFreePosition(boardToUse, w, h, { x: clampedX, y: clampedY }, [], viewState)
     }
 
+    // Pre-plan multi-element batches through coordinated batch layout
+    const layoutToolNames = new Set([
+      "write_text", "add_text", "add_equation", "draw_rectangle", "draw_circle",
+      "draw_triangle", "draw_line", "add_line", "draw_arrow", "add_arrow", "draw_path"
+    ])
+    const batchCandidates = functionCalls.filter((fc) => {
+      const n = fc.name || fc.function_name || ""
+      return layoutToolNames.has(n)
+    })
+    const isUnplacedBatch = batchCandidates.length >= 2 && batchCandidates.some((fc) => {
+      const a = fc.args || fc.parameters || {}
+      return a.x === undefined || a.y === undefined || (a.x === 0 && a.y === 0)
+    })
+    let batchPlannedMap: Map<any, any> | null = null
+    if (isUnplacedBatch) {
+      try {
+        const batchPlan = planBatchLayout(batchCandidates, latest.current, viewState, sel.current)
+        if (batchPlan && batchPlan.items && batchPlan.items.length === batchCandidates.length) {
+          batchPlannedMap = new Map()
+          for (let i = 0; i < batchCandidates.length; i++) {
+            batchPlannedMap.set(batchCandidates[i], batchPlan.items[i])
+          }
+        }
+      } catch (err) {
+        console.warn("planBatchLayout fallback to sequential placement:", err)
+      }
+    }
+
     for (const fc of functionCalls) {
+      const planned = batchPlannedMap ? batchPlannedMap.get(fc) : null
       const rawName = fc.name || fc.function_name || ""
       const name = rawName === "add_text" ? "write_text"
         : rawName === "add_line" ? "draw_line"
@@ -762,7 +792,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
         : rawName
       const args = fc.args || fc.parameters || {}
       let result: Record<string, any> = { result: "ok" }
-      const id = "ai_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+      const id = fc.element_id || fc.functionCall?.element_id || ("st_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6))
 
       try {
         if (name === "pan_view") {
@@ -789,9 +819,9 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             }
           }
         } else if (name === "draw_rectangle") {
-          const w = args.width || 120
-          const h = args.height || 80
-          const coords = normalizeCoords(args.x, args.y, w, h)
+          const w = planned ? planned.box.w : (args.width || 120)
+          const h = planned ? planned.box.h : (args.height || 80)
+          const coords = planned ? { x: planned.box.x, y: planned.box.y } : normalizeCoords(args.x, args.y, w, h)
           addedElements.push({
             id,
             kind: "shape",
@@ -807,8 +837,8 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
           })
         } else if (name === "draw_circle") {
           const r = args.radius || 40
-          const size = r * 2
-          const coords = normalizeCoords(args.x !== undefined ? args.x - r : undefined, args.y !== undefined ? args.y - r : undefined, size, size)
+          const size = planned ? planned.box.w : r * 2
+          const coords = planned ? { x: planned.box.x, y: planned.box.y } : normalizeCoords(args.x !== undefined ? args.x - r : undefined, args.y !== undefined ? args.y - r : undefined, size, size)
           addedElements.push({
             id,
             kind: "circle",
@@ -823,9 +853,9 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             filled: args.filled,
           })
         } else if (name === "draw_triangle") {
-          const w = args.width || 100
-          const h = args.height || 100
-          const coords = normalizeCoords(args.x, args.y, w, h)
+          const w = planned ? planned.box.w : (args.width || 100)
+          const h = planned ? planned.box.h : (args.height || 100)
+          const coords = planned ? { x: planned.box.x, y: planned.box.y } : normalizeCoords(args.x, args.y, w, h)
           addedElements.push({
             id,
             kind: "triangle",
@@ -869,18 +899,20 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             strokeWidth: args.strokeWidth || 3,
           })
         } else if (name === "draw_arrow") {
-          let x1 = args.x1 ?? 100
-          let y1 = args.y1 ?? 100
-          let x2 = args.x2 ?? 200
-          let y2 = args.y2 ?? 200
-          if (args.from_element_id && args.to_element_id) {
+          let x1 = planned ? planned.args.x1 : (args.x1 ?? 100)
+          let y1 = planned ? planned.args.y1 : (args.y1 ?? 100)
+          let x2 = planned ? planned.args.x2 : (args.x2 ?? 200)
+          let y2 = planned ? planned.args.y2 : (args.y2 ?? 200)
+          const fromId = args.from_element_id || args.fromId || args.from || planned?.args?.fromId
+          const toId = args.to_element_id || args.toId || args.to || planned?.args?.toId
+          if (!planned && fromId && toId) {
             const allEls = [...latest.current.elements, ...addedElements]
-            const fromEl = allEls.find((e) => e.id === args.from_element_id)
-            const toEl = allEls.find((e) => e.id === args.to_element_id)
+            const fromEl = allEls.find((e) => e.id === fromId)
+            const toEl = allEls.find((e) => e.id === toId)
             if (fromEl && toEl) {
               const arrowPts = computeArrowEndpoints(
-                { x: fromEl.x, y: fromEl.y, w: fromEl.w, h: fromEl.h },
-                { x: toEl.x, y: toEl.y, w: toEl.w, h: toEl.h }
+                getElementBoundingBox(fromEl),
+                getElementBoundingBox(toEl)
               )
               x1 = arrowPts.x1
               y1 = arrowPts.y1
@@ -899,16 +931,23 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             h: Math.max(10, Math.abs(y2 - y1)),
             x2,
             y2,
+            fromId,
+            toId,
             color: args.color || "#2563eb",
             strokeWidth: args.strokeWidth || 4,
           })
         } else if (name === "write_text") {
-          const dims = estimateContentDimensions({ kind: "text", text: args.text, fontSize: 28 })
+          const dims = estimateContentDimensions({
+            kind: "text",
+            text: args.text,
+            fontSize: args.fontSize,
+            role: args.role,
+          })
           const currentBoardState: Board = {
             ...latest.current,
             elements: [...latest.current.elements, ...addedElements],
           }
-          const targetPos = normalizeCoords(args.x, args.y, dims.w, dims.h, currentBoardState)
+          const targetPos = planned ? { x: planned.box.x, y: planned.box.y } : normalizeCoords(args.x, args.y, dims.w, dims.h, currentBoardState)
           addedElements.push({
             id,
             kind: "text",
@@ -916,11 +955,11 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             seq: 0,
             x: targetPos.x,
             y: targetPos.y,
-            w: dims.w,
-            h: dims.h,
+            w: planned ? planned.box.w : dims.w,
+            h: planned ? planned.box.h : dims.h,
             text: args.text,
             color: args.color || "#000000",
-            fontSize: 28,
+            fontSize: planned?.args?.fontSize || dims.fontSize,
           })
         } else if (name === "add_equation") {
           const dims = estimateContentDimensions({ kind: "equation", latex: args.latex })
@@ -928,7 +967,7 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             ...latest.current,
             elements: [...latest.current.elements, ...addedElements],
           }
-          const targetPos = normalizeCoords(args.x, args.y, dims.w, dims.h, currentBoardState)
+          const targetPos = planned ? { x: planned.box.x, y: planned.box.y } : normalizeCoords(args.x, args.y, dims.w, dims.h, currentBoardState)
           addedElements.push({
             id,
             kind: "equation",
@@ -936,8 +975,8 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
             seq: 0,
             x: targetPos.x,
             y: targetPos.y,
-            w: dims.w,
-            h: dims.h,
+            w: planned ? planned.box.w : dims.w,
+            h: planned ? planned.box.h : dims.h,
             latex: args.latex,
             color: args.color || "#000000",
           })
@@ -972,6 +1011,15 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
                 e.id === id ? { ...e, kind: "simulation" as const, code, title: args.title || "Math Plot", isLoading: false } : e
               )
               change({ ...current, elements: updated })
+              setTimeout(() => {
+                if (smartBoardRef.current) {
+                  const renderedBounds = smartBoardRef.current.getAllRenderedBounds()
+                  if (renderedBounds.size > 0) {
+                    const { needsReflow, updatedElements } = verifyAndReflowLayout(latest.current, renderedBounds)
+                    if (needsReflow) change({ ...latest.current, elements: updatedElements })
+                  }
+                }
+              }, 80)
             }
           })
         } else if (name === "clear_board") {
@@ -1005,6 +1053,15 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
               const current = latest.current
               const updated = current.elements.map((e) => (e.id === id ? { ...e, kind: "image" as const, src, isLoading: false } : e))
               change({ ...current, elements: updated })
+              setTimeout(() => {
+                if (smartBoardRef.current) {
+                  const renderedBounds = smartBoardRef.current.getAllRenderedBounds()
+                  if (renderedBounds.size > 0) {
+                    const { needsReflow, updatedElements } = verifyAndReflowLayout(latest.current, renderedBounds)
+                    if (needsReflow) change({ ...latest.current, elements: updatedElements })
+                  }
+                }
+              }, 80)
             }
           })
         } else if (name === "generate_simulation") {
@@ -1037,22 +1094,50 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
                 e.id === id ? { ...e, kind: "simulation" as const, code, title: args.title, isLoading: false } : e
               )
               change({ ...current, elements: updated })
+              setTimeout(() => {
+                if (smartBoardRef.current) {
+                  const renderedBounds = smartBoardRef.current.getAllRenderedBounds()
+                  if (renderedBounds.size > 0) {
+                    const { needsReflow, updatedElements } = verifyAndReflowLayout(latest.current, renderedBounds)
+                    if (needsReflow) change({ ...latest.current, elements: updatedElements })
+                  }
+                }
+              }, 80)
             }
           })
         } else if (name === "generate_vector_drawing") {
           setIsAIProcessing(true)
-          const originPos = normalizeCoords(args.x, args.y, 400, 300)
           generateVectorDrawing(args.prompt).then((shapes) => {
             setIsAIProcessing(false)
-            if (shapes && Array.isArray(shapes)) {
-              const newShapes: BoardElement[] = shapes.map((s: any) => ({
-                id: "v_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+            if (shapes && Array.isArray(shapes) && shapes.length > 0) {
+              // Calculate composite bounding box of vector shapes
+              let minX = Infinity
+              let minY = Infinity
+              let maxX = -Infinity
+              let maxY = -Infinity
+              shapes.forEach((s: any) => {
+                const sx = s.x || 0
+                const sy = s.y || 0
+                const sw = s.width || (s.radius ? s.radius * 2 : 80)
+                const sh = s.height || (s.radius ? s.radius * 2 : 80)
+                minX = Math.min(minX, sx)
+                minY = Math.min(minY, sy)
+                maxX = Math.max(maxX, sx + sw)
+                maxY = Math.max(maxY, sy + sh)
+              })
+              const totalW = Math.max(100, maxX - minX)
+              const totalH = Math.max(80, maxY - minY)
+              const originPos = normalizeCoords(args.x, args.y, totalW, totalH)
+
+              const baseId = fc.element_id || fc.functionCall?.element_id || id
+              const newShapes: BoardElement[] = shapes.map((s: any, idx: number) => ({
+                id: `${baseId}_${idx}`,
                 kind: s.type === "circle" ? "circle" : s.type === "triangle" ? "triangle" : s.type === "line" ? "line" : "shape",
                 shape: s.type === "circle" ? "circle" : s.type === "triangle" ? "triangle" : "rect",
                 author: "coach",
                 seq: 0,
-                x: originPos.x + (s.x || 0),
-                y: originPos.y + (s.y || 0),
+                x: originPos.x + ((s.x || 0) - minX),
+                y: originPos.y + ((s.y || 0) - minY),
                 w: s.width || (s.radius ? s.radius * 2 : 80),
                 h: s.height || (s.radius ? s.radius * 2 : 80),
                 color: s.color || "#000",
@@ -1521,7 +1606,12 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       }
 
       if (result.functionCalls && result.functionCalls.length > 0) {
-        await executeTools(result.functionCalls.map((fc: any) => fc.functionCall || fc))
+        await executeTools(
+          result.functionCalls.map((fc: any) => ({
+            ...(fc.functionCall || fc),
+            element_id: fc.element_id || fc.functionCall?.element_id,
+          }))
+        )
       }
     } catch (e: any) {
       console.error("Chat Error:", e)

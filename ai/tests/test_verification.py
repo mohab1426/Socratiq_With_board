@@ -62,7 +62,7 @@ def test_generate_challenge_explain(monkeypatch, verification_service):
 
 def test_generate_challenge_modify(monkeypatch, verification_service):
     fake_payload = GeneratedChallengePayload(
-        question="How would your update rule change if we wanted to maximize the objective function?",
+        question="What changes if we maximize the objective function instead?",
         criteria=["Inverts the sign of the update step", "Explains ascent vs descent"],
     )
     monkeypatch.setattr(
@@ -80,11 +80,13 @@ def test_generate_challenge_modify(monkeypatch, verification_service):
 
     assert challenge.verification_type == VerificationType.MODIFY
     assert "maximize" in challenge.question.lower()
+    words = challenge.question.split()
+    assert 5 <= len(words) <= 12
 
 
 def test_generate_challenge_transfer(monkeypatch, verification_service):
     fake_payload = GeneratedChallengePayload(
-        question="How would you apply iterative parameter optimization to adjust learning rate adaptively?",
+        question="How would you apply gradient descent to adjust drone altitude?",
         criteria=["Identifies feedback mechanism", "Explains adaptation threshold"],
     )
     monkeypatch.setattr(
@@ -101,6 +103,8 @@ def test_generate_challenge_transfer(monkeypatch, verification_service):
     challenge = verification_service.generate_challenge(req)
 
     assert challenge.verification_type == VerificationType.TRANSFER
+    words = challenge.question.split()
+    assert 5 <= len(words) <= 12
 
 
 def test_generate_challenge_fallback_on_llm_failure(monkeypatch, verification_service):
@@ -278,3 +282,98 @@ def test_verify_insufficient_evidence_on_llm_failure(monkeypatch, verification_s
     assert result.confidence == 0.0
     assert result.evidence_candidate is None
     assert "issue evaluating" in result.feedback
+
+
+def test_verification_challenge_prompts_enforce_short_constraints():
+    """Verify that challenge and evaluation prompts enforce 5-12 words, single direct question, and concise answers."""
+    from ai.verification.strategies.explain import ExplainStrategy
+    from ai.verification.strategies.modify import ModifyStrategy
+    from ai.verification.strategies.transfer import TransferStrategy
+
+    explain = ExplainStrategy()
+    modify = ModifyStrategy()
+    transfer = TransferStrategy()
+
+    req = VerificationChallengeRequest(
+        assignment_id="asg_1",
+        concept="binary_search",
+        verification_type=VerificationType.EXPLAIN,
+        student_work="def search(arr, x): ...",
+    )
+
+    # Explain prompt checks
+    explain_msgs = explain.build_challenge_prompt(req)
+    explain_sys = explain_msgs[0].content
+    assert "5–12 words" in explain_sys or "5-12 words" in explain_sys
+    assert "one direct question" in explain_sys.lower()
+    assert "short answer" in explain_sys.lower()
+    assert "multiple choice" in explain_sys.lower()
+
+    # Modify prompt checks
+    req.verification_type = VerificationType.MODIFY
+    modify_msgs = modify.build_challenge_prompt(req)
+    modify_sys = modify_msgs[0].content
+    assert "5–12 words" in modify_sys or "5-12 words" in modify_sys
+    assert "one condition or assumption" in modify_sys.lower()
+    assert "what changes" in modify_sys.lower()
+    assert "short answer" in modify_sys.lower()
+
+    # Transfer prompt checks
+    req.verification_type = VerificationType.TRANSFER
+    transfer_msgs = transfer.build_challenge_prompt(req)
+    transfer_sys = transfer_msgs[0].content
+    assert "5–12 words" in transfer_sys or "5-12 words" in transfer_sys
+    assert "simple case" in transfer_sys.lower() or "novel" in transfer_sys.lower()
+    assert "short answer" in transfer_sys.lower()
+
+    # Evaluation prompts check that concise 1-sentence answers can PASS
+    eval_req = VerificationRequest(
+        student_id="s1",
+        assignment_id="a1",
+        concept="binary_search",
+        verification_type=VerificationType.EXPLAIN,
+        challenge_question="Why divide by 2?",
+        student_response="It cuts the search space in half.",
+    )
+    for strat in (explain, modify, transfer):
+        eval_req.verification_type = strat.verification_type
+        eval_msgs = strat.build_evaluation_prompt(eval_req)
+        eval_sys = eval_msgs[0].content
+        assert "concise" in eval_sys.lower()
+        assert "sentence" in eval_sys.lower()
+
+
+def test_generate_challenge_fallbacks_are_concise_and_distinct(monkeypatch, verification_service):
+    """Verify fallbacks across Explain, Modify, and Transfer are 5-12 words, contain concept, and are distinct."""
+    monkeypatch.setattr(
+        "ai.verification.service.get_structured_llm",
+        lambda role, schema: FakeStructuredLLM(raises=RuntimeError("LLM unavailable")),
+    )
+
+    concept = "recursion"
+    challenges = {}
+    for vtype in (VerificationType.EXPLAIN, VerificationType.MODIFY, VerificationType.TRANSFER):
+        req = VerificationChallengeRequest(
+            assignment_id="asg_1",
+            concept=concept,
+            verification_type=vtype,
+            student_work="def fact(n): return 1 if n<=1 else n*fact(n-1)",
+        )
+        ch = verification_service.generate_challenge(req)
+        challenges[vtype] = ch
+
+        # Verify concept inclusion
+        assert concept in ch.question
+
+        # Verify word count 5-12 words
+        words = ch.question.split()
+        assert 5 <= len(words) <= 12, f"Fallback for {vtype} had {len(words)} words: '{ch.question}'"
+
+    # Verify all 3 questions are mutually distinct
+    questions = [ch.question for ch in challenges.values()]
+    assert len(set(questions)) == 3, f"Fallback questions must be distinct: {questions}"
+
+    # Verify distinct pedagogical focuses
+    assert "why" in challenges[VerificationType.EXPLAIN].question.lower()
+    assert "changes" in challenges[VerificationType.MODIFY].question.lower()
+    assert "where else" in challenges[VerificationType.TRANSFER].question.lower()

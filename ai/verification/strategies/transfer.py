@@ -12,13 +12,18 @@ from ai.verification.models import (
 )
 from ai.verification.strategies.base import BaseVerificationStrategy
 
-_CHALLENGE_SYSTEM = """You are an expert pedagogy system designing a 'Conceptual Transfer' verification question.
-Given a student's demonstrated competence on concept ({concept}), design a novel scenario in a different setting or application.
-Ask the student how the principles of ({concept}) apply to this new scenario.
+_CHALLENGE_SYSTEM = """You are an expert pedagogy system designing a concise 'Conceptual Transfer' verification question.
+Given a student's demonstrated competence on concept ({concept}), ask them to apply the concept to one new, simple case or domain.
 
 Requirements:
-- Propose a new, plausible problem setting distinct from their current assignment.
-- Ask how the underlying principles of ({concept}) apply.
+- Ask the student to apply ({concept}) to one new, simple case or domain.
+- Target the concept specifically: {concept}.
+- Length constraint: Prefer 5–12 words per question whenever practical.
+- Ask only one thing. Avoid compound questions, elaborate backstories, or long hypothetical scenarios.
+- Require a short answer, ideally one sentence or a few words.
+- Adapt the question to the student's demonstrated understanding.
+- Distinctness: Must test application to a new simple case, distinct from explaining the current solution (Explain) or changing a condition (Modify).
+- Do NOT make it multiple choice.
 - Define 2-3 clear criteria for evaluating conceptual transfer.
 """
 
@@ -26,10 +31,10 @@ _EVALUATION_SYSTEM = """You are an expert pedagogical evaluator assessing a stud
 Determine whether the student can abstract the core principles of the concept and apply them correctly to a novel domain.
 
 Evaluation Outcomes:
-- PASS: The student successfully transferred the concept, identifying the correct mapping and nuances.
-- PARTIAL: The student transferred the core intuition but struggled with some specifics or mappings.
+- PASS: The student successfully transferred the concept to the new case. Note: Concise, accurate answers (a single sentence or a few words) must be awarded PASS if conceptually sound.
+- PARTIAL: The student transferred the core intuition but struggled with minor specifics.
 - NEEDS_RETRY: The student failed to transfer the concept or misapplied it completely.
-- INSUFFICIENT_EVIDENCE: The response is evasive, off-topic, or too vague to evaluate.
+- INSUFFICIENT_EVIDENCE: The response is evasive, completely off-topic, or empty. Do NOT flag a response as insufficient evidence simply because it is concise or only one sentence.
 
 Scoring:
 - PASS: score >= 0.8

@@ -40,7 +40,9 @@ logger = logging.getLogger(__name__)
 class GeneratedChallengePayload(BaseModel):
     """Schema for challenge generation LLM response."""
 
-    question: str = Field(description="The verification question / challenge.")
+    question: str = Field(
+        description="The short verification question (prefer 5-12 words, single direct question, requires a short 1-sentence answer)."
+    )
     criteria: list[str] = Field(
         default_factory=list, description="2-3 specific rubric criteria for evaluation."
     )
@@ -75,15 +77,21 @@ class VerificationService:
             )
         except Exception as exc:
             logger.exception("Challenge generation failed, returning fallback challenge.")
-            fallback_question = (
-                f"Please explain in your own words how the concept of '{request.concept}' "
-                f"operates in your solution and why this approach was chosen."
-            )
+            if request.verification_type == VerificationType.MODIFY:
+                fallback_question = f"What changes if {request.concept} is modified or reversed?"
+                criteria = [f"Identifies how changes affect {request.concept}"]
+            elif request.verification_type == VerificationType.TRANSFER:
+                fallback_question = f"Where else could you apply {request.concept}?"
+                criteria = [f"Identifies a new application of {request.concept}"]
+            else:
+                fallback_question = f"Why does {request.concept} work in your solution?"
+                criteria = [f"Explains the mechanism of {request.concept}"]
+
             return VerificationChallenge(
                 verification_type=request.verification_type,
                 concept=request.concept,
                 question=fallback_question,
-                criteria=[f"Demonstrates sound understanding of {request.concept}"],
+                criteria=criteria,
             )
 
     def verify(self, request: VerificationRequest) -> VerificationResult:

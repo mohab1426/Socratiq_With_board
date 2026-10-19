@@ -110,10 +110,24 @@ export function estimateContentDimensions(item: {
   height?: number
   radius?: number
   fontSize?: number
-}): { w: number; h: number } {
+  role?: "heading" | "step" | "body" | "annotation" | "label"
+}): { w: number; h: number; fontSize: number } {
   if (item.kind === "text") {
     const text = item.text || ""
-    const fontSize = item.fontSize || 24
+    let fontSize = item.fontSize
+    if (!fontSize) {
+      if (
+        item.role === "heading" ||
+        text.startsWith("#") ||
+        (text.length <= 40 && (text.endsWith(":") || text.startsWith("Step")) && !text.includes("\n"))
+      ) {
+        fontSize = 32
+      } else if (item.role === "annotation" || item.role === "label") {
+        fontSize = 18
+      } else {
+        fontSize = 24
+      }
+    }
     const lines = text.split("\n")
     const longestLine = Math.max(...lines.map((l) => l.length), 1)
 
@@ -130,28 +144,30 @@ export function estimateContentDimensions(item: {
 
     const lineHeight = fontSize * 1.35 + 8
     const h = Math.max(56, Math.round(wrappedLineCount * lineHeight + 20))
-    return { w, h }
+    return { w, h, fontSize }
   }
 
   if (item.kind === "equation") {
     const latex = item.latex || ""
+    const lines = latex.split(/\\\\|\n/).length
     const isTall = ["\\frac", "\\sum", "\\int", "\\begin", "\\\\", "\\sqrt", "\\lim", "\\matrix", "\\prod"].some((t) =>
       latex.includes(t)
     )
-    const estimatedW = Math.min(940, Math.max(240, latex.length * 22 + 40))
-    const estimatedH = isTall ? 150 : 96
-    return { w: estimatedW, h: estimatedH }
+    const estimatedW = Math.min(940, Math.max(240, latex.length * 20 + 40))
+    const estimatedH = Math.max(lines > 1 ? 70 * lines : 96, isTall ? (lines > 1 ? 80 * lines : 150) : 96)
+    return { w: estimatedW, h: estimatedH, fontSize: 24 }
   }
 
   if (item.kind === "circle") {
     const r = item.radius || 40
-    return { w: r * 2, h: r * 2 }
+    return { w: r * 2, h: r * 2, fontSize: 24 }
   }
 
   if (item.kind === "shape" || item.kind === "rect") {
     return {
       w: Math.max(60, item.width || 140),
       h: Math.max(40, item.height || 90),
+      fontSize: 24,
     }
   }
 
@@ -159,27 +175,30 @@ export function estimateContentDimensions(item: {
     return {
       w: Math.max(60, item.width || 110),
       h: Math.max(60, item.height || 110),
+      fontSize: 24,
     }
   }
 
   if (item.kind === "simulation") {
-    return { w: 480, h: 360 }
+    return { w: 480, h: 360, fontSize: 24 }
   }
 
   if (item.kind === "image") {
-    return { w: 380, h: 280 }
+    return { w: 380, h: 280, fontSize: 24 }
   }
 
   if (item.kind === "arrow" || item.kind === "line") {
     return {
       w: Math.max(60, item.width || 160),
       h: Math.max(20, item.height || 30),
+      fontSize: 24,
     }
   }
 
   return {
     w: Math.max(80, item.width || 200),
     h: Math.max(50, item.height || 100),
+    fontSize: 24,
   }
 }
 
@@ -256,8 +275,13 @@ export function findCollisionFreePosition(
     }
   }
 
-  // 3. Global scan across columns (Left column, then Right column)
-  const columns = [BOARD_PADDING, 1020]
+  // 3. Global scan across multi-column workspace (Left, Center, Right columns across BOARD_W)
+  const colStep = Math.max(340, Math.round(w + buffer))
+  const columns: number[] = []
+  for (let c = BOARD_PADDING; c <= maxX; c += colStep) {
+    columns.push(c)
+  }
+  if (!columns.includes(BOARD_PADDING)) columns.unshift(BOARD_PADDING)
   const stepY = 40
 
   for (const colX of columns) {
@@ -465,8 +489,31 @@ export function planBatchLayout(
     let x2 = args.x2 ?? 240
     let y2 = args.y2 ?? 100
 
-    // If arrow should connect two consecutively placed items in this batch
-    if (plannedItems.length >= 2 && (args.x1 === undefined || (args.x1 === 0 && args.x2 === 0))) {
+    const fromId = args.from_element_id || args.fromId || args.from
+    const toId = args.to_element_id || args.toId || args.to
+
+    if (fromId || toId) {
+      const allItems = [
+        ...currentBoard.elements.map((e) => ({ id: e.id, box: getElementBoundingBox(e) })),
+        ...plannedItems,
+      ]
+      const fromItem = fromId ? allItems.find((i) => i.id === fromId) : null
+      const toItem = toId ? allItems.find((i) => i.id === toId) : null
+      if (fromItem && toItem) {
+        const endpoints = computeArrowEndpoints(fromItem.box, toItem.box)
+        x1 = endpoints.x1
+        y1 = endpoints.y1
+        x2 = endpoints.x2
+        y2 = endpoints.y2
+      } else if (fromItem) {
+        x1 = fromItem.box.x + fromItem.box.w
+        y1 = Math.round(fromItem.box.y + fromItem.box.h / 2)
+      } else if (toItem) {
+        x2 = toItem.box.x
+        y2 = Math.round(toItem.box.y + toItem.box.h / 2)
+      }
+    } else if (plannedItems.length >= 2 && (args.x1 === undefined || (args.x1 === 0 && args.x2 === 0))) {
+      // Connect two consecutively placed items in this batch
       const prev1 = plannedItems[plannedItems.length - 2].box
       const prev2 = plannedItems[plannedItems.length - 1].box
       const endpoints = computeArrowEndpoints(prev1, prev2)
@@ -488,7 +535,16 @@ export function planBatchLayout(
       id,
       kind: name === "draw_arrow" ? "arrow" : "line",
       name,
-      args: { ...args, x1, y1, x2, y2, color: args.color || (name === "draw_arrow" ? "#2563eb" : "#000000") },
+      args: {
+        ...args,
+        x1,
+        y1,
+        x2,
+        y2,
+        fromId,
+        toId,
+        color: args.color || (name === "draw_arrow" ? "#2563eb" : "#000000"),
+      },
       box,
       author: "coach",
     })
@@ -552,6 +608,7 @@ export function readBoardState(board: Board): BoardStateAnalysis {
 /**
  * Step 6: Verifies post-render bounding boxes and reflows coach elements if text wrapping
  * or latex rendering created unexpected overlaps. Never moves student work.
+ * Preserves connector endpoints so arrows stay attached and do not pierce shapes.
  */
 export function verifyAndReflowLayout(
   board: Board,
@@ -561,6 +618,7 @@ export function verifyAndReflowLayout(
   const boundsMap = renderedBounds instanceof Map ? renderedBounds : new Map(Object.entries(renderedBounds))
   let needsReflow = false
   const updatedElements: BoardElement[] = board.elements.map((el) => ({ ...el }))
+  const shiftDeltas = new Map<string, { dx: number; dy: number; oldBox: RectBox }>()
 
   for (let i = 0; i < updatedElements.length; i++) {
     const el = updatedElements[i]
@@ -576,12 +634,15 @@ export function verifyAndReflowLayout(
   for (let i = 0; i < updatedElements.length; i++) {
     const current = updatedElements[i]
     if (current.author === "student") continue // Student elements are strictly protected!
+    if (current.kind === "arrow" || current.kind === "line") continue // Connectors adjusted after nodes settle
 
-    let currentBox = getElementBoundingBox(current)
+    const initialBox = getElementBoundingBox(current)
+    let currentBox = initialBox
 
     for (let j = 0; j < updatedElements.length; j++) {
       if (i === j) continue
       const other = updatedElements[j]
+      if (other.kind === "arrow" || other.kind === "line") continue
       const otherBox = getElementBoundingBox(other)
 
       if (doBoxesIntersect(currentBox, otherBox, buffer)) {
@@ -591,6 +652,62 @@ export function verifyAndReflowLayout(
             current.y += shiftY
             needsReflow = true
             currentBox = getElementBoundingBox(current)
+            shiftDeltas.set(current.id, {
+              dx: 0,
+              dy: (shiftDeltas.get(current.id)?.dy || 0) + shiftY,
+              oldBox: initialBox,
+            })
+          }
+        }
+      }
+    }
+  }
+
+  // Reflow and reconnect arrows/lines attached to shifted elements
+  if (shiftDeltas.size > 0) {
+    for (const el of updatedElements) {
+      if (el.kind === "arrow" || el.kind === "line") {
+        const fromEl = el.fromId ? updatedElements.find((e) => e.id === el.fromId) : undefined
+        const toEl = el.toId ? updatedElements.find((e) => e.id === el.toId) : undefined
+
+        // If explicitly connected by IDs, recompute exact perimeter endpoints
+        if (fromEl && toEl) {
+          const newEndpoints = computeArrowEndpoints(getElementBoundingBox(fromEl), getElementBoundingBox(toEl))
+          el.x = Math.min(newEndpoints.x1, newEndpoints.x2)
+          el.y = Math.min(newEndpoints.y1, newEndpoints.y2)
+          el.w = Math.max(10, Math.abs(newEndpoints.x2 - newEndpoints.x1))
+          el.h = Math.max(10, Math.abs(newEndpoints.y2 - newEndpoints.y1))
+          el.x2 = newEndpoints.x2
+          el.y2 = newEndpoints.y2
+          needsReflow = true
+        } else {
+          // If not connected by explicit IDs, check if endpoints were touching shifted element boxes
+          let x1 = el.x
+          let y1 = el.y
+          let x2 = el.x2 ?? el.x + el.w
+          let y2 = el.y2 ?? el.y + el.h
+
+          for (const [, delta] of shiftDeltas.entries()) {
+            const b = delta.oldBox
+            // Check if (x1, y1) was near or inside the old bounding box of the shifted element
+            if (x1 >= b.x - buffer && x1 <= b.x + b.w + buffer && y1 >= b.y - buffer && y1 <= b.y + b.h + buffer) {
+              y1 += delta.dy
+              needsReflow = true
+            }
+            // Check if (x2, y2) was near or inside the old bounding box of the shifted element
+            if (x2 >= b.x - buffer && x2 <= b.x + b.w + buffer && y2 >= b.y - buffer && y2 <= b.y + b.h + buffer) {
+              y2 += delta.dy
+              needsReflow = true
+            }
+          }
+
+          if (needsReflow) {
+            el.x = Math.min(x1, x2)
+            el.y = Math.min(y1, y2)
+            el.w = Math.max(10, Math.abs(x2 - x1))
+            el.h = Math.max(10, Math.abs(y2 - y1))
+            el.x2 = x2
+            el.y2 = y2
           }
         }
       }

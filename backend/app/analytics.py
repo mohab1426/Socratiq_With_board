@@ -51,7 +51,7 @@ def course_students(c, course_id: str, university_id: str) -> list[dict]:
           (SELECT avg(res.score)::float FROM verification_results res JOIN verification_questions q ON q.question_id = res.question_id
              JOIN verification_runs v ON v.verification_id = q.verification_id
             WHERE v.student_id = r.user_id AND v.assignment_id IN (SELECT assignment_id FROM pub) AND res.outcome <> 'INSUFFICIENT_EVIDENCE') AS mastery_score,
-          (SELECT count(*) FROM verification_runs v WHERE v.student_id = r.user_id AND v.status = 'COMPLETED' AND v.overall_outcome IN ('PASS','PARTIAL') AND v.assignment_id IN (SELECT assignment_id FROM pub))::int AS verified_ok
+          (SELECT count(DISTINCT v.assignment_id) FROM verification_runs v WHERE v.student_id = r.user_id AND v.status = 'COMPLETED' AND v.overall_outcome IN ('PASS','PARTIAL') AND v.assignment_id IN (SELECT assignment_id FROM pub))::int AS verified_ok
         FROM roster r ORDER BY r.last_name NULLS LAST, r.first_name NULLS LAST, r.email""", {"c": course_id, "u": university_id})
     return [{"id": r["user_id"], "name": _name(r), "email": r["email"], "task_submission": _pct(r["submitted"], total),
              "socratic_ai_usage": _pct(r["coached"], total), "observed_signal_rate": _pct(r["signalled"], total),
@@ -119,7 +119,7 @@ def course_dashboard(c, user: CurrentUser, course_id: str) -> dict[str, Any]:
     verified = sum(s["_verified_ok"] for s in students)
     # mean of each student's LATEST graded submission per assignment, as a percentage of ITS OWN maximum (scales differ per assignment)
     grade = one(c, """SELECT avg(pct)::float AS g FROM (
-                        SELECT DISTINCT ON (sub.student_id, sub.assignment_id) sub.score / sub.max_score * 100 AS pct
+                        SELECT DISTINCT ON (sub.student_id, sub.assignment_id) sub.score / NULLIF(sub.max_score, 0) * 100 AS pct
                           FROM submissions sub JOIN assignments a ON a.assignment_id = sub.assignment_id JOIN attempts t ON t.attempt_id = sub.attempt_id
                          WHERE a.course_id = %s AND sub.score IS NOT NULL AND sub.student_id = ANY(%s)       -- enrolled roster only
                          ORDER BY sub.student_id, sub.assignment_id, t.attempt_number DESC) g""", (course_id, [s["id"] for s in students]))["g"]

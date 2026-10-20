@@ -165,7 +165,7 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
   const baseClasses = `backdrop-blur-md rounded-2xl shadow-xl border transition-all duration-200 select-none ${
     isDark ? 'bg-zinc-900/95 border-zinc-700/80 text-zinc-100 shadow-black/40' : 'bg-white/95 border-gray-200/90 text-gray-800 shadow-slate-900/10'
   }`;
-  const btnClasses = `w-8 h-8 rounded-xl transition-all flex items-center justify-center shrink-0 ${
+  const btnClasses = `min-w-[36px] min-h-[36px] sm:min-w-[32px] sm:min-h-[32px] w-9 h-9 sm:w-8 sm:h-8 rounded-xl transition-all flex items-center justify-center shrink-0 touch-manipulation ${
     isDark
       ? 'hover:bg-zinc-800 text-zinc-300 hover:text-white'
       : 'hover:bg-gray-100 text-gray-600 hover:text-gray-900'
@@ -215,7 +215,7 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
       <div
         role="toolbar"
         aria-label="Whiteboard tools"
-        className={`absolute top-3 left-1/2 -translate-x-1/2 flex items-center gap-1 p-1.5 z-30 max-w-[calc(100vw-8rem)] overflow-x-auto thin-scroll ${baseClasses}`}
+        className={`absolute top-2 left-2 right-[148px] sm:right-[156px] lg:right-auto lg:top-3 lg:left-1/2 lg:-translate-x-1/2 flex items-center gap-0.5 sm:gap-1 p-1 sm:p-1.5 z-30 lg:max-w-[calc(100vw-14rem)] overflow-x-auto thin-scroll ${baseClasses}`}
       >
         {/* Navigation & Selection Group */}
         <div className="flex items-center gap-0.5">
@@ -321,7 +321,7 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
       {/* 2. CONTEXTUAL PROPERTIES & SIZING BAR: Color, Fill, Font, Object Sizing */}
       {showContextualBar && (
         <div
-          className={`absolute top-16 left-1/2 -translate-x-1/2 flex items-center gap-2 p-1.5 px-3 z-30 max-w-[calc(100vw-6rem)] overflow-x-auto thin-scroll animate-in fade-in slide-in-from-top-1 ${baseClasses}`}
+          className={`absolute top-14 left-2 lg:top-16 lg:left-1/2 lg:-translate-x-1/2 flex items-center gap-1.5 sm:gap-2 p-1 sm:p-1.5 px-2 sm:px-3 z-30 max-w-[calc(100vw-1rem)] lg:max-w-[calc(100vw-6rem)] overflow-x-auto thin-scroll animate-in fade-in slide-in-from-top-1 ${baseClasses}`}
         >
           {/* Color Palette Swatches */}
           <div className="flex items-center gap-1.5 px-1">
@@ -330,7 +330,7 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
                 key={c}
                 type="button"
                 onClick={() => setColor(c)}
-                className={`w-4 h-4 rounded-full border border-black/15 transition-all ${
+                className={`w-5 h-5 sm:w-4 sm:h-4 rounded-full border border-black/15 transition-all shrink-0 touch-manipulation ${
                   currentColor === c ? 'ring-2 ring-offset-1 ring-teal-600 scale-125' : 'hover:scale-110'
                 }`}
                 style={{ backgroundColor: c }}
@@ -517,7 +517,7 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
 
       {/* 3. VIEWPORT & ZOOM DOCK: Bottom-Right Corner */}
       <div
-        className={`absolute bottom-4 right-4 flex items-center gap-1 p-1 px-1.5 z-30 ${baseClasses}`}
+        className={`absolute bottom-16 right-2 lg:bottom-4 lg:right-4 flex items-center gap-0.5 sm:gap-1 p-0.5 sm:p-1 px-1 sm:px-1.5 z-30 ${baseClasses}`}
       >
         <button
           type="button"
@@ -531,7 +531,7 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
         <button
           type="button"
           onClick={onFitView}
-          className="px-1.5 py-0.5 text-xs font-mono font-medium rounded hover:bg-gray-100 dark:hover:bg-zinc-800 text-gray-700 dark:text-gray-300"
+          className="px-1 sm:px-1.5 py-0.5 text-xs font-mono font-medium rounded hover:bg-gray-100 dark:hover:bg-zinc-800 text-gray-700 dark:text-gray-300"
           title="Zoom level (Click to fit content)"
         >
           {Math.round((zoomScale || 0.4) * 100)}%
@@ -558,13 +558,13 @@ export const SmartBoardToolbar: React.FC<ToolbarProps> = ({
 
       {/* 4. LIVE & THEME PILL: Top-Right Corner */}
       <div
-        className={`absolute top-3 right-3 flex items-center gap-1.5 p-1 px-1.5 z-30 ${baseClasses}`}
+        className={`absolute top-2 right-2 lg:top-3 lg:right-3 flex items-center gap-1 sm:gap-1.5 p-1 px-1.5 z-30 shrink-0 ${baseClasses}`}
       >
         <button
           onClick={onToggleMic}
           type="button"
           className={`
-            w-8 h-8 rounded-full flex items-center justify-center transition-all
+            w-9 h-9 sm:w-8 sm:h-8 rounded-full flex items-center justify-center transition-all shrink-0 touch-manipulation
             ${
               aiState.isConnected
                 ? 'bg-red-500 hover:bg-red-600 text-white shadow-red-200 ring-2 ring-red-400'

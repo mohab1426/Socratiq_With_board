@@ -28,7 +28,7 @@ export function AppShell({
   const { data: courses = [] } = useCourses(role)
 
   return (
-    <div className="flex min-h-screen bg-[var(--color-canvas)]">
+    <div className="flex min-h-[100dvh] bg-[var(--color-canvas)]">
       <a
         href="#main"
         className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-50 focus:rounded-full focus:bg-[var(--color-ink)] focus:px-4 focus:py-2 focus:text-sm focus:text-white"

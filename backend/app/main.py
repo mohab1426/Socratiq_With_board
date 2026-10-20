@@ -98,7 +98,8 @@ def create_app(*, db: Optional[Database] = None, storage: Any = None, token_veri
 
     if cfg.is_production and "*" in cfg.cors_origins:
         raise RuntimeError("CORS_ORIGINS must list explicit origins in production")
-    app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_origin_regex=r"^https://.*\.trycloudflare\.com$",
+                       allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
                        allow_headers=["Authorization", "Content-Type", "X-Request-ID"], expose_headers=["X-Request-ID"])
 
     @app.middleware("http")

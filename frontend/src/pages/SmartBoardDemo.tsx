@@ -14,7 +14,7 @@ export default function SmartBoardDemo() {
   })
 
   return (
-    <div className="w-screen h-screen">
+    <div className="w-screen h-[100dvh] overflow-hidden">
       <BoardWorkspace
         assignmentId="demo-assignment"
         initial={initialBoard}

@@ -6,6 +6,21 @@ export function installDomStubs() {
   HTMLCanvasElement.prototype.getContext = (() => ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext
   class RO { observe() {} unobserve() {} disconnect() {} }
   ;(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = RO
+  if (typeof (globalThis as any).PointerEvent === "undefined") {
+    class PointerEvent extends MouseEvent {
+      pointerId: number
+      pointerType: string
+      constructor(type: string, params: any = {}) {
+        super(type, params)
+        this.pointerId = params.pointerId ?? 0
+        this.pointerType = params.pointerType ?? ""
+      }
+    }
+    ;(globalThis as any).PointerEvent = PointerEvent
+    if (typeof window !== "undefined") {
+      ;(window as any).PointerEvent = PointerEvent
+    }
+  }
   Element.prototype.setPointerCapture = () => {}
   Element.prototype.releasePointerCapture = () => {}
   Element.prototype.scrollTo = (() => {}) as unknown as typeof Element.prototype.scrollTo

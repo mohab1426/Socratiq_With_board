@@ -514,8 +514,21 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
 
   const handleFitView = useCallback(() => {
     const currentElements = latest.current.elements
+    const viewW = root.current?.clientWidth || 1000
+    const viewH = root.current?.clientHeight || 700
+
+    const usableW = Math.max(280, viewW - 24)
+    const usableH = Math.max(280, viewH - 110)
+
     if (currentElements.length === 0) {
-      setViewState({ x: 0, y: 0, scale: 0.4 })
+      const scale = Math.max(0.15, Math.min(1.0, Math.min(usableW / BOARD_W, usableH / BOARD_H)))
+      const centerX = BOARD_W / 2
+      const centerY = BOARD_H / 2
+      setViewState({
+        x: centerX - viewW / (2 * scale),
+        y: centerY - viewH / (2 * scale),
+        scale,
+      })
       return
     }
 
@@ -531,14 +544,11 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       maxY = Math.max(maxY, el.y + el.h)
     })
 
-    const pad = 120
-    const contentW = Math.max(400, maxX - minX + pad * 2)
-    const contentH = Math.max(400, maxY - minY + pad * 2)
+    const pad = 80
+    const contentW = Math.max(300, maxX - minX + pad * 2)
+    const contentH = Math.max(300, maxY - minY + pad * 2)
 
-    const viewW = root.current?.clientWidth || 1000
-    const viewH = root.current?.clientHeight || 700
-
-    const scale = Math.max(0.15, Math.min(1.2, Math.min(viewW / contentW, viewH / contentH)))
+    const scale = Math.max(0.15, Math.min(1.2, Math.min(usableW / contentW, usableH / contentH)))
     const centerX = (minX + maxX) / 2
     const centerY = (minY + maxY) / 2
 
@@ -548,6 +558,31 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       scale,
     })
   }, [])
+
+  const initialFitDoneRef = useRef(false)
+
+  // One-time initial fit: observes root until valid dimensions are reported, then disconnects immediately
+  useEffect(() => {
+    if (!root.current || initialFitDoneRef.current) return
+    if (root.current.clientWidth > 0 && root.current.clientHeight > 0) {
+      initialFitDoneRef.current = true
+      handleFitView()
+      return
+    }
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.contentRect.width > 0 && entry.contentRect.height > 0) {
+          if (!initialFitDoneRef.current) {
+            initialFitDoneRef.current = true
+            handleFitView()
+            ro.disconnect()
+          }
+        }
+      }
+    })
+    ro.observe(root.current)
+    return () => ro.disconnect()
+  }, [handleFitView])
 
   const [isFullscreen, setIsFullscreen] = useState(false)
 
@@ -1650,19 +1685,19 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
       ref={root}
       className={cn(
         "relative flex h-full min-h-0 flex-col overflow-hidden bg-[var(--color-surface-muted)]",
-        isFullscreen && "fixed inset-0 z-50 w-screen h-screen"
+        isFullscreen && "fixed inset-0 z-50 w-screen h-[100dvh] min-h-[100dvh]"
       )}
     >
       {/* Top action header for SocratiQ Socratic coach interaction */}
-      <div className="flex items-center justify-between border-b border-[var(--color-border)] bg-white px-3 py-1.5 z-20">
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold uppercase tracking-wider text-[var(--color-teal-dark)]">SmartBoard</span>
-          <span role="status" aria-live="polite" className="text-xs text-[var(--color-ink-muted)]">
+      <div className="flex items-center justify-between border-b border-[var(--color-border)] bg-white px-2.5 sm:px-3 py-1 sm:py-1.5 z-20 shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+          <span className="text-xs font-semibold uppercase tracking-wider text-[var(--color-teal-dark)] shrink-0">SmartBoard</span>
+          <span role="status" aria-live="polite" className="text-xs text-[var(--color-ink-muted)] truncate max-w-[130px] sm:max-w-none">
             {busy ? "SocratiQ is writing on the board…" : status}
           </span>
         </div>
 
-        <div className="relative">
+        <div className="relative shrink-0">
           <Button
             type="button"
             size="sm"
@@ -1673,11 +1708,11 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
               e.stopPropagation()
               setAskOpen((v) => !v)
             }}
-            className="gap-1.5"
+            className="gap-1 sm:gap-1.5 px-2.5 py-1 text-xs sm:text-sm h-8"
           >
-            <Sparkles className="h-4 w-4" aria-hidden="true" />
+            <Sparkles className="h-3.5 w-3.5 sm:h-4 sm:w-4" aria-hidden="true" />
             <span>Ask SocratiQ</span>
-            <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+            <ChevronDown className="h-3 w-3 sm:h-3.5 sm:w-3.5" aria-hidden="true" />
           </Button>
           {askOpen && (
             <div
@@ -1799,7 +1834,12 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
 
         {/* Equation Editing Dialog */}
         {eq && (
-          <div role="dialog" aria-label="Add an equation" className="absolute inset-x-3 top-4 z-40 mx-auto max-w-lg rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-white p-4 shadow-xl">
+          <div
+            role="dialog"
+            aria-label="Add an equation"
+            className="absolute inset-x-2 sm:inset-x-3 top-2 sm:top-6 z-40 mx-auto max-w-[calc(100vw-1rem)] sm:max-w-lg max-h-[85dvh] overflow-y-auto rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-white p-3 sm:p-4 shadow-xl select-none"
+            style={{ touchAction: "auto" }}
+          >
             <label htmlFor="eq-input" className="text-sm font-semibold text-[var(--color-ink)]">
               {eq.editId ? "Edit equation" : "Add an equation"}
             </label>
@@ -1837,12 +1877,18 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
 
         {/* Floating SmartBoard AI Chat Bar (Bottom Center) */}
         {!readOnly && (
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 w-full max-w-xl px-4 z-40 pointer-events-none flex flex-col gap-2">
+          <div
+            className="absolute bottom-2 sm:bottom-4 left-1/2 -translate-x-1/2 w-full max-w-xl px-2 sm:px-4 z-40 pointer-events-none flex flex-col gap-2 pb-[env(safe-area-inset-bottom,0px)]"
+            style={{ touchAction: "auto" }}
+          >
             {chatMessages.length > 0 && showChat && (
-              <div className={cn(
-                "backdrop-blur-md rounded-2xl shadow-2xl border p-4 max-h-[360px] overflow-y-auto pointer-events-auto flex flex-col gap-2.5 mb-1 transition-colors",
-                theme === "dark" ? "bg-zinc-950/90 border-zinc-800 text-white" : "bg-white/95 border-gray-200 text-gray-900"
-              )}>
+              <div
+                className={cn(
+                  "backdrop-blur-md rounded-2xl shadow-2xl border p-3 sm:p-4 max-h-[50dvh] sm:max-h-[360px] overflow-y-auto pointer-events-auto flex flex-col gap-2.5 mb-1 transition-colors",
+                  theme === "dark" ? "bg-zinc-950/90 border-zinc-800 text-white" : "bg-white/95 border-gray-200 text-gray-900"
+                )}
+                style={{ touchAction: "auto" }}
+              >
                 <div className="flex justify-between items-center border-b pb-1.5 border-[var(--color-border)]">
                   <span className="text-xs font-bold uppercase tracking-wider text-gray-400">SmartBoard AI Assistant</span>
                   <button
@@ -1888,9 +1934,10 @@ export const BoardWorkspace = forwardRef<BoardApi, Props>(function BoardWorkspac
                 }
               }}
               className={cn(
-                "pointer-events-auto flex items-center gap-2 backdrop-blur-md p-1.5 px-3 rounded-full shadow-2xl border transition-all",
+                "pointer-events-auto flex items-center gap-1.5 sm:gap-2 backdrop-blur-md p-1 sm:p-1.5 px-2.5 sm:px-3 rounded-full shadow-2xl border transition-all",
                 theme === "dark" ? "bg-zinc-900/90 border-zinc-700 shadow-black/40" : "bg-white/95 border-gray-200 shadow-xl"
               )}
+              style={{ touchAction: "auto" }}
             >
               <button
                 type="button"

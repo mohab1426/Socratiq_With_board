@@ -364,8 +364,132 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
 
   const byId = new Map(board.elements.map((e) => [e.id, e]))
 
+  const pointerMap = useRef<Map<number, { clientX: number; clientY: number }>>(new Map())
+  const isPinchingRef = useRef<boolean>(false)
+  const pinchStartRef = useRef<{ dist: number; midX: number; midY: number; scale: number; panX: number; panY: number } | null>(null)
+  const lastPinchTimeRef = useRef<number>(0)
+
+  const abortActiveInteraction = useCallback(() => {
+    if (drawing.current) {
+      drawing.current = null
+      redraw()
+    }
+    if (draft) {
+      setDraft(null)
+    }
+    if (drag.current) {
+      drag.current = null
+      setDragPos(null)
+      setMultiDragOffset(null)
+    }
+    if (interactionMode === "selecting") {
+      setSelectionRect(null)
+      setInteractionMode("idle")
+    }
+  }, [draft, interactionMode, redraw])
+
+  const handleTouchGestureDown = (e: React.PointerEvent): boolean => {
+    const pType = e.pointerType || (e.nativeEvent as any)?.pointerType || ""
+    if (pType !== "touch") return false
+    pointerMap.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY })
+
+    if (pointerMap.current.size >= 2) {
+      isPinchingRef.current = true
+      lastPinchTimeRef.current = Date.now()
+      abortActiveInteraction()
+
+      try {
+        if (e.currentTarget && "releasePointerCapture" in e.currentTarget && (e.currentTarget as any).hasPointerCapture?.(e.pointerId)) {
+          (e.currentTarget as any).releasePointerCapture(e.pointerId)
+        }
+      } catch {}
+
+      const pts = Array.from(pointerMap.current.values()).slice(0, 2)
+      const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY)
+      const midX = (pts[0].clientX + pts[1].clientX) / 2
+      const midY = (pts[0].clientY + pts[1].clientY) / 2
+      pinchStartRef.current = {
+        dist: Math.max(dist, 1),
+        midX,
+        midY,
+        scale: effectiveScale,
+        panX: effectivePan.x,
+        panY: effectivePan.y,
+      }
+      return true
+    }
+
+    if (isPinchingRef.current || Date.now() - lastPinchTimeRef.current < 250) {
+      return true
+    }
+
+    return false
+  }
+
+  const handleTouchGestureMove = (e: React.PointerEvent): boolean => {
+    const pType = e.pointerType || (e.nativeEvent as any)?.pointerType || ""
+    if (pType !== "touch") return false
+    pointerMap.current.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY })
+
+    if (isPinchingRef.current) {
+      if (pointerMap.current.size >= 2) {
+        const pts = Array.from(pointerMap.current.values()).slice(0, 2)
+        const dist = Math.hypot(pts[1].clientX - pts[0].clientX, pts[1].clientY - pts[0].clientY)
+        const midX = (pts[0].clientX + pts[1].clientX) / 2
+        const midY = (pts[0].clientY + pts[1].clientY) / 2
+
+        const start = pinchStartRef.current
+        if (start) {
+          const scaleFactor = dist / start.dist
+          const newScale = Math.max(0.15, Math.min(4.0, start.scale * scaleFactor))
+
+          const r = stage.current?.getBoundingClientRect() ?? { left: 0, top: 0 }
+          const bx = Math.min(Math.max((start.midX - r.left) / start.scale, 0), BOARD_W)
+          const by = Math.min(Math.max((start.midY - r.top) / start.scale, 0), BOARD_H)
+
+          const deltaX = midX - start.midX
+          const deltaY = midY - start.midY
+
+          const newPanX = bx - (bx - start.panX) * (start.scale / newScale) - (deltaX / newScale)
+          const newPanY = by - (by - start.panY) * (start.scale / newScale) - (deltaY / newScale)
+
+          updateView({ x: newPanX, y: newPanY, scale: newScale })
+        }
+      }
+      return true
+    }
+    return false
+  }
+
+  const handleTouchGestureUp = (e: React.PointerEvent): boolean => {
+    const pType = e.pointerType || (e.nativeEvent as any)?.pointerType || ""
+    if (pType !== "touch") return false
+    pointerMap.current.delete(e.pointerId)
+
+    if (isPinchingRef.current) {
+      lastPinchTimeRef.current = Date.now()
+      if (pointerMap.current.size === 0) {
+        isPinchingRef.current = false
+        pinchStartRef.current = null
+      }
+      return true
+    }
+
+    if (Date.now() - lastPinchTimeRef.current < 250) {
+      return true
+    }
+
+    return false
+  }
+
+  function cancel(e: React.PointerEvent) {
+    handleTouchGestureUp(e)
+    abortActiveInteraction()
+  }
+
   // Overlay tool pointer handlers
   function down(e: React.PointerEvent) {
+    if (handleTouchGestureDown(e)) return
     if (!overlayOn || !onChange) return
     const p = at(e)
 
@@ -422,6 +546,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
   }
 
   function move(e: React.PointerEvent) {
+    if (handleTouchGestureMove(e)) return
     if (drag.current && drag.current.id === "__pan__") {
       const dx = (e.clientX - drag.current.px) / effectiveScale
       const dy = (e.clientY - drag.current.py) / effectiveScale
@@ -442,6 +567,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
   }
 
   function up(e: React.PointerEvent) {
+    if (handleTouchGestureUp(e)) return
     if (drag.current && drag.current.id === "__pan__") {
       drag.current = null
       return
@@ -553,6 +679,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
 
   // Select tool: drag / move / resize / rotate
   function elDown(e: React.PointerEvent, el: BoardElement) {
+    if (handleTouchGestureDown(e)) return
     if (!interactive || tool !== "select") return
     e.stopPropagation()
     const isShift = e.shiftKey
@@ -569,6 +696,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
   }
 
   function elMove(e: React.PointerEvent) {
+    if (handleTouchGestureMove(e)) return
     const d = drag.current
     if (!d || interactionMode !== "idle") return
     const p = at(e)
@@ -584,7 +712,8 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
     }
   }
 
-  function elUp() {
+  function elUp(e?: React.PointerEvent) {
+    if (e && handleTouchGestureUp(e)) return
     const d = drag.current
     drag.current = null
     if (d?.moved && onChange) {
@@ -800,8 +929,10 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
                 : "linear-gradient(to right, #e5e7eb 1px, transparent 1px), linear-gradient(to bottom, #e5e7eb 1px, transparent 1px)"
               : undefined,
             backgroundSize: grid ? "40px 40px" : undefined,
+            touchAction: "none",
           }}
           onPointerDown={(e) => {
+            if (handleTouchGestureDown(e)) return
             if (interactive && tool === "select") {
               if ((e.target as HTMLElement).tagName !== "TEXTAREA") {
                 const p = at(e)
@@ -812,12 +943,14 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
             }
           }}
           onPointerMove={(e) => {
+            if (handleTouchGestureMove(e)) return
             if (interactionMode === "selecting" && selectionRect) {
               const p = at(e)
               setSelectionRect((prev) => (prev ? { ...prev, w: p[0] - prev.x, h: p[1] - prev.y } : null))
             }
           }}
-          onPointerUp={() => {
+          onPointerUp={(e) => {
+            if (handleTouchGestureUp(e)) return
             if (interactionMode === "selecting" && selectionRect) {
               const rx = selectionRect.w < 0 ? selectionRect.x + selectionRect.w : selectionRect.x
               const ry = selectionRect.h < 0 ? selectionRect.y + selectionRect.h : selectionRect.y
@@ -838,6 +971,11 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
               setSelectionRect(null)
               setInteractionMode("idle")
             }
+          }}
+          onPointerCancel={(e) => {
+            handleTouchGestureUp(e)
+            setSelectionRect(null)
+            setInteractionMode("idle")
           }}
         >
           <canvas ref={canvas} width={BOARD_W} height={BOARD_H} className="pointer-events-none absolute left-0 top-0" aria-hidden="true" />
@@ -1300,7 +1438,7 @@ export const SmartBoard = React.forwardRef<SmartBoardHandle, Props>(function Sma
               onPointerDown={down}
               onPointerMove={move}
               onPointerUp={up}
-              onPointerCancel={up}
+              onPointerCancel={cancel}
             />
           )}
 

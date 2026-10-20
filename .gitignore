@@ -23,3 +23,6 @@ data/uploads/
 data/rag_documents/
 ai/data/
 ai/tests/data/
+scripts/bin/
+scripts/*.log
+scripts/*.pid

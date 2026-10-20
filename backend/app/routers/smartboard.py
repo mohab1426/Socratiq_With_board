@@ -31,7 +31,17 @@ from ai.rag.security import sanitize_untrusted_text
 log = logging.getLogger("socratiq.smartboard")
 
 router = APIRouter(prefix="/smartboard", tags=["smartboard"])
-SMARTBOARD_MODEL = os.getenv("SMARTBOARD_GEMINI_MODEL", "gemini-flash-lite-latest")
+SMARTBOARD_MODEL = os.getenv("SMARTBOARD_GEMINI_MODEL", "gemini-3-flash-preview")
+
+
+def _get_smartboard_models() -> list[str]:
+    primary = os.getenv("SMARTBOARD_GEMINI_MODEL", "gemini-3-flash-preview").strip()
+    fallbacks = ["gemini-3-flash-preview", "gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]
+    result: list[str] = []
+    for m in [primary] + fallbacks:
+        if m and m not in result:
+            result.append(m)
+    return result
 
 
 def _get_gemini_keys() -> list[str]:
@@ -53,6 +63,59 @@ def _get_gemini_keys() -> list[str]:
 def _get_gemini_key() -> Optional[str]:
     keys = _get_gemini_keys()
     return keys[0] if keys else None
+
+
+async def _call_gemini_generate_content(
+    payload: Dict[str, Any],
+    timeout: float = 35.0,
+    preferred_models: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    key_check = _get_gemini_key()
+    if not key_check:
+        raise HTTPException(status_code=503, detail="Gemini API key is not configured")
+
+    keys = _get_gemini_keys()
+    if key_check not in keys:
+        keys = [key_check] + keys
+    if not keys:
+        raise HTTPException(status_code=503, detail="Gemini API key is not configured")
+
+    models = preferred_models or _get_smartboard_models()
+    last_status = 503
+    last_error = "No response from Gemini API"
+    had_timeout = False
+
+    import httpx
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for model in models:
+            for key in keys:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+                try:
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code == 200:
+                        return resp.json()
+
+                    last_status = resp.status_code
+                    last_error = resp.text
+                    log.warning(
+                        "Gemini generateContent call failed on model=%s, key=%s..., status=%s: %s",
+                        model, key[:8] if len(key) >= 8 else key, resp.status_code, resp.text[:120]
+                    )
+                    # If model not found / deprecated (404), skip remaining keys for this model
+                    if resp.status_code == 404:
+                        break
+                except httpx.TimeoutException as exc:
+                    had_timeout = True
+                    last_status = 504
+                    last_error = "Gemini API timed out"
+                    log.warning("Gemini generateContent timeout on model=%s: %s", model, exc)
+                except Exception as exc:
+                    log.warning("Gemini generateContent exception on model=%s: %s", model, exc)
+                    last_error = str(exc)
+
+    if had_timeout and last_status == 503:
+        last_status = 504
+    raise HTTPException(status_code=last_status, detail=f"Gemini API error: {last_error}")
 
 
 def _authenticate_token(token: str, app: Any) -> Optional[CurrentUser]:
@@ -306,43 +369,30 @@ async def generate_image(body: ImageGenIn):
 
 @router.post("/generate-simulation")
 async def generate_simulation(body: SimulationGenIn):
-    key = _get_gemini_key()
-    if not key:
-        raise HTTPException(status_code=503, detail="Gemini API key is not configured")
-
     system_prompt = (
         f'Create a self-contained, interactive HTML/JS simulation for: "{body.prompt}".\n'
         '- Use Tailwind CSS for styling.\n'
         '- Important: Use a clean, modern design with a WHITE background (bg-white) and dark text (text-slate-900) to fit a light-mode whiteboard.\n'
         '- It must fit within a 500x400px container.\n'
-        '- Return ONLY the HTML code (no markdown fences).\n'
+        '- Keep the code concise, efficient, and direct without boilerplate comments.\n'
+        '- Return ONLY the raw HTML code (no markdown fences, no explanations).\n'
         '- Ensure it is visually appealing, responsive and fully interactive.'
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{SMARTBOARD_MODEL}:generateContent?key={key}"
     payload = {
         "contents": [{"parts": [{"text": system_prompt}]}]
     }
 
-    import httpx
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=f"Gemini error: {resp.text}")
-        data = resp.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            code = text.replace("```html", "").replace("```", "").strip()
-            return {"code": code}
-        except (KeyError, IndexError):
-            raise HTTPException(status_code=500, detail="Malformed model response")
+    data = await _call_gemini_generate_content(payload, timeout=40.0)
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        code = text.replace("```html", "").replace("```", "").strip()
+        return {"code": code}
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=500, detail="Malformed model response")
 
 
 @router.post("/generate-vector")
 async def generate_vector(body: VectorGenIn):
-    key = _get_gemini_key()
-    if not key:
-        raise HTTPException(status_code=503, detail="Gemini API key is not configured")
-
     prompt = (
         f'Generate a vector drawing for: "{body.prompt}".\n'
         'Return a JSON object with an "elements" property containing an array of shapes.\n'
@@ -355,25 +405,19 @@ async def generate_vector(body: VectorGenIn):
         'Coordinates should be relative to (0,0) as the top-left of the drawing.\n'
         'Output ONLY valid JSON.'
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{SMARTBOARD_MODEL}:generateContent?key={key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"responseMimeType": "application/json"}
     }
 
-    import httpx
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=f"Gemini error: {resp.text}")
-        data = resp.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(text)
-            return parsed
-        except Exception as e:
-            log.warning("Vector parsing error: %s", e)
-            return {"elements": []}
+    data = await _call_gemini_generate_content(payload, timeout=30.0)
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        return parsed
+    except Exception as e:
+        log.warning("Vector parsing error: %s", e)
+        return {"elements": []}
 
 
 @router.post("/chat")
@@ -549,18 +593,14 @@ async def chat(request: Request, body: ChatIn):
     if body.tools:
         config["tools"] = [{"functionDeclarations": body.tools}]
     config["systemInstruction"] = {"parts": [{"text": enriched_system_instruction}]}
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{SMARTBOARD_MODEL}:generateContent?key={key}"
     payload = {
         "contents": contents,
         **({"tools": config["tools"]} if "tools" in config else {}),
         "systemInstruction": config["systemInstruction"]
     }
 
-    import httpx
-    import base64
-
     # Validate audio base64 if present
+    import base64
     for idx, m in enumerate(body.messages):
         if m.audio:
             if len(m.audio) > 10 * 1024 * 1024:  # 10MB limit
@@ -571,86 +611,76 @@ async def chat(request: Request, body: ChatIn):
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid audio base64 payload")
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    data = await _call_gemini_generate_content(payload, timeout=45.0)
+
+    reply_text = None
+    function_calls = []
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        for p in parts:
+            if "text" in p and not reply_text:
+                reply_text = p["text"]
+            if "functionCall" in p:
+                function_calls.append({"functionCall": p["functionCall"]})
+    except (KeyError, IndexError):
+        pass
+
+    # Persist interaction telemetry for teacher dashboard & analytics and issue signed coach element IDs
+    if db and user and a:
         try:
-            resp = await client.post(url, json=payload)
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Gemini API timed out")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to communicate with Gemini: {str(e)}")
+            with db.tx() as c:
+                att = one(c, "SELECT * FROM attempts WHERE student_id=%s AND assignment_id=%s AND status IN ('DRAFT','IN_PROGRESS') ORDER BY attempt_number DESC LIMIT 1",
+                          (user.user_id, a["assignment_id"]))
+                if att:
+                    coach_element_ids = []
+                    for fc in function_calls:
+                        el_id = sign_coach_element_id(att["attempt_id"])
+                        fc["element_id"] = el_id
+                        if "functionCall" in fc:
+                            fc["functionCall"]["element_id"] = el_id
+                        coach_element_ids.append(el_id)
 
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=f"Gemini error: {resp.text}")
-        data = resp.json()
-        
-        reply_text = None
-        function_calls = []
-        try:
-            parts = data["candidates"][0]["content"]["parts"]
-            for p in parts:
-                if "text" in p and not reply_text:
-                    reply_text = p["text"]
-                if "functionCall" in p:
-                    function_calls.append({"functionCall": p["functionCall"]})
-        except (KeyError, IndexError):
-            pass
-
-        # Persist interaction telemetry for teacher dashboard & analytics and issue signed coach element IDs
-        if db and user and a:
-            try:
-                with db.tx() as c:
-                    att = one(c, "SELECT * FROM attempts WHERE student_id=%s AND assignment_id=%s AND status IN ('DRAFT','IN_PROGRESS') ORDER BY attempt_number DESC LIMIT 1",
-                              (user.user_id, a["assignment_id"]))
-                    if att:
-                        coach_element_ids = []
-                        for fc in function_calls:
-                            el_id = sign_coach_element_id(att["attempt_id"])
-                            fc["element_id"] = el_id
-                            if "functionCall" in fc:
-                                fc["functionCall"]["element_id"] = el_id
-                            coach_element_ids.append(el_id)
-
+                    sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att["attempt_id"],))
+                    if sess is None:
+                        sess_id = new_id("ses")
+                        c.execute("""INSERT INTO ai_sessions (session_id, student_id, assignment_id, attempt_id, policy, university_id)
+                                     VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+                                  (sess_id, user.user_id, a["assignment_id"], att["attempt_id"], a.get("default_policy") or "SOCRATIC", user.university_id))
                         sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att["attempt_id"],))
-                        if sess is None:
-                            sess_id = new_id("ses")
-                            c.execute("""INSERT INTO ai_sessions (session_id, student_id, assignment_id, attempt_id, policy, university_id)
-                                         VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
-                                      (sess_id, user.user_id, a["assignment_id"], att["attempt_id"], a.get("default_policy") or "SOCRATIC", user.university_id))
-                            sess = one(c, "SELECT * FROM ai_sessions WHERE attempt_id=%s AND status='ACTIVE' ORDER BY started_at DESC LIMIT 1", (att["attempt_id"],))
 
-                        if sess:
-                            interaction_id = new_id("int")
-                            tool_names = [fc["functionCall"]["name"] for fc in function_calls if "functionCall" in fc and "name" in fc["functionCall"]]
-                            c.execute("""INSERT INTO ai_interactions (interaction_id, session_id, student_id, assignment_id, intervention_type, assistance_level, diagnosis,
-                                            diagnosis_confidence, diagnosis_explanation, diagnosis_evidence, response, referenced_concepts, tools_used, university_id)
-                                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)""",
-                                      (interaction_id, sess["session_id"], user.user_id, a["assignment_id"],
-                                       "SMARTBOARD_GUIDANCE", "SUGGESTION", "GUIDED_PRACTICE", 0.9,
-                                       "SmartBoard AI collaborative interaction", "Interactive whiteboard exploration",
-                                       reply_text or "SmartBoard action", json.dumps([]), json.dumps(tool_names), user.university_id))
+                    if sess:
+                        interaction_id = new_id("int")
+                        tool_names = [fc["functionCall"]["name"] for fc in function_calls if "functionCall" in fc and "name" in fc["functionCall"]]
+                        c.execute("""INSERT INTO ai_interactions (interaction_id, session_id, student_id, assignment_id, intervention_type, assistance_level, diagnosis,
+                                        diagnosis_confidence, diagnosis_explanation, diagnosis_evidence, response, referenced_concepts, tools_used, university_id)
+                                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)""",
+                                  (interaction_id, sess["session_id"], user.user_id, a["assignment_id"],
+                                   "SMARTBOARD_GUIDANCE", "SUGGESTION", "GUIDED_PRACTICE", 0.9,
+                                   "SmartBoard AI collaborative interaction", "Interactive whiteboard exploration",
+                                   reply_text or "SmartBoard action", json.dumps([]), json.dumps(tool_names), user.university_id))
 
-                            last_user_text = next((m.text for m in reversed(body.messages) if m.role == "user" and m.text), "SmartBoard interaction")
-                            c.execute("INSERT INTO messages (message_id, session_id, sender, content, created_at) VALUES (%s,%s,'STUDENT',%s, clock_timestamp())",
-                                      (new_id("msg"), sess["session_id"], last_user_text))
-                            c.execute("INSERT INTO messages (message_id, session_id, sender, content, interaction_id, created_at) VALUES (%s,%s,'COACH',%s,%s, clock_timestamp())",
-                                      (new_id("msg"), sess["session_id"], reply_text or "SmartBoard whiteboard update", interaction_id))
+                        last_user_text = next((m.text for m in reversed(body.messages) if m.role == "user" and m.text), "SmartBoard interaction")
+                        c.execute("INSERT INTO messages (message_id, session_id, sender, content, created_at) VALUES (%s,%s,'STUDENT',%s, clock_timestamp())",
+                                  (new_id("msg"), sess["session_id"], last_user_text))
+                        c.execute("INSERT INTO messages (message_id, session_id, sender, content, interaction_id, created_at) VALUES (%s,%s,'COACH',%s,%s, clock_timestamp())",
+                                  (new_id("msg"), sess["session_id"], reply_text or "SmartBoard whiteboard update", interaction_id))
 
-                            insert_event(c, student_id=user.user_id, university_id=user.university_id, event_type="AI_INTERACTION",
-                                         assignment_id=a["assignment_id"], session_id=sess["session_id"], attempt_id=att["attempt_id"],
-                                         interaction_id=interaction_id,
-                                         payload={
-                                             "intervention": "SMARTBOARD_GUIDANCE",
-                                             "tools_used": tool_names,
-                                             "coach_element_ids": coach_element_ids,
-                                             "sources": len(sources),
-                                             "mode": "smartboard",
-                                             "channel": "chat"
-                                         })
-                            c.execute("UPDATE ai_sessions SET turn_count = turn_count + 1 WHERE session_id=%s", (sess["session_id"],))
-            except Exception as e:
-                log.warning("Failed to record SmartBoard telemetry: %s", e)
+                        insert_event(c, student_id=user.user_id, university_id=user.university_id, event_type="AI_INTERACTION",
+                                     assignment_id=a["assignment_id"], session_id=sess["session_id"], attempt_id=att["attempt_id"],
+                                     interaction_id=interaction_id,
+                                     payload={
+                                         "intervention": "SMARTBOARD_GUIDANCE",
+                                         "tools_used": tool_names,
+                                         "coach_element_ids": coach_element_ids,
+                                         "sources": len(sources),
+                                         "mode": "smartboard",
+                                         "channel": "chat"
+                                     })
+                        c.execute("UPDATE ai_sessions SET turn_count = turn_count + 1 WHERE session_id=%s", (sess["session_id"],))
+        except Exception as e:
+            log.warning("Failed to record SmartBoard telemetry: %s", e)
 
-        return {"text": reply_text, "functionCalls": function_calls, "sources": sources}
+    return {"text": reply_text, "functionCalls": function_calls, "sources": sources}
 
 
 @router.websocket("/live")

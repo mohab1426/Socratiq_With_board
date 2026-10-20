@@ -427,3 +427,56 @@ def test_smartboard_chat_educational_grounding_and_sources():
                             assert "STUDENT'S CURRENT SMARTBOARD WORK" in sys_text
 
 
+def test_smartboard_simulation_model_fallback():
+    db = MagicMock()
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=MagicMock(), run_worker=False)
+    client = TestClient(app)
+
+    responses = [
+        # First attempt: primary model fails with 503 high demand
+        MagicMock(status_code=503, text='{"error": "high demand"}'),
+        # Second attempt: fallback model succeeds with 200
+        MagicMock(
+            status_code=200,
+            json=lambda: {"candidates": [{"content": {"parts": [{"text": "```html<div>fallback simulation</div>```"}]}}]}
+        ),
+    ]
+
+    with patch("backend.app.routers.smartboard._get_gemini_keys", return_value=["key1"]):
+        with patch("backend.app.routers.smartboard._get_smartboard_models", return_value=["model_primary", "model_fallback"]):
+            with patch("httpx.AsyncClient.post", side_effect=responses) as mock_post:
+                r = client.post("/api/v1/smartboard/generate-simulation", json={"prompt": "wave simulation"})
+                assert r.status_code == 200
+                assert r.json()["code"] == "<div>fallback simulation</div>"
+                assert mock_post.call_count == 2
+                assert "model_primary" in mock_post.call_args_list[0][0][0]
+                assert "model_fallback" in mock_post.call_args_list[1][0][0]
+
+
+def test_smartboard_simulation_key_rotation():
+    db = MagicMock()
+    app = create_app(db=db, storage=MagicMock(), token_verifier=MagicMock(), ai_adapter=MagicMock(), rag=MagicMock(), run_worker=False)
+    client = TestClient(app)
+
+    responses = [
+        # First key returns 429 rate limit
+        MagicMock(status_code=429, text='{"error": "rate limit"}'),
+        # Second key returns 200 OK
+        MagicMock(
+            status_code=200,
+            json=lambda: {"candidates": [{"content": {"parts": [{"text": "```html<div>rotated key sim</div>```"}]}}]}
+        ),
+    ]
+
+    with patch("backend.app.routers.smartboard._get_gemini_keys", return_value=["key_a", "key_b"]):
+        with patch("backend.app.routers.smartboard._get_smartboard_models", return_value=["test_model"]):
+            with patch("httpx.AsyncClient.post", side_effect=responses) as mock_post:
+                r = client.post("/api/v1/smartboard/generate-simulation", json={"prompt": "pendulum"})
+                assert r.status_code == 200
+                assert r.json()["code"] == "<div>rotated key sim</div>"
+                assert mock_post.call_count == 2
+                assert "key=key_a" in mock_post.call_args_list[0][0][0]
+                assert "key=key_b" in mock_post.call_args_list[1][0][0]
+
+
+
